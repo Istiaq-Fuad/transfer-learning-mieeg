@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "skills": {
+    "mne": {
+      "source": "tondevrel/scientific-agent-skills",
+      "sourceType": "github",
+      "computedHash": "98d4fe026cd940d96b4f9160dff2c5f1601c6dfd2921041090c1146155a0e291"
+    },
+    "python-project-structure": {
+      "source": "wshobson/agents",
+      "sourceType": "github",
+      "computedHash": "2f4f560964af8ecad4d54666c044baa54671d0abd1136c848b539befe24db170"
+    },
+    "web-search": {
+      "source": "inference-sh-8/skills",
+      "sourceType": "github",
+      "computedHash": "b8655d778f12f230023a68e636aecca86c8558a51792c0f367abde4d3020c75d"
+    }
+  }
+}

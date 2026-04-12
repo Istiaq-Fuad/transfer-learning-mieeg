@@ -1,0 +1,320 @@
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import torch
+from sklearn.metrics import cohen_kappa_score
+from torch import nn
+from torch.optim import Adam
+
+try:
+    from data.loader import (
+        create_within_subject_dataloaders,
+        load_moabb_motor_imagery_dataset,
+    )
+    from models.model import EEGModel
+    from utils.reproducibility import (
+        create_experiment_metadata,
+        save_experiment_metadata,
+        set_seed_everywhere,
+    )
+except ModuleNotFoundError:
+    import sys
+
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    from data.loader import (
+        create_within_subject_dataloaders,
+        load_moabb_motor_imagery_dataset,
+    )
+    from models.model import EEGModel
+    from utils.reproducibility import (
+        create_experiment_metadata,
+        save_experiment_metadata,
+        set_seed_everywhere,
+    )
+
+
+def setup_logger(output_dir: Path) -> logging.Logger:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("within_subject")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    file_handler = logging.FileHandler(output_dir / "train.log", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    return logger
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    data_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> dict[str, float]:
+    model.eval()
+    all_preds: list[int] = []
+    all_targets: list[int] = []
+    correct = 0
+    total = 0
+
+    for x, y, _ in data_loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        logits, _ = model(x, lambda_=0.0)
+        preds = logits.argmax(dim=1)
+
+        total += y.size(0)
+        correct += (preds == y).sum().item()
+
+        all_preds.extend(preds.cpu().tolist())
+        all_targets.extend(y.cpu().tolist())
+
+    acc = correct / max(total, 1)
+    kappa = cohen_kappa_score(all_targets, all_preds) if total > 0 else 0.0
+    return {"accuracy": float(acc), "kappa": float(kappa)}
+
+
+def train_one_subject(
+    model: EEGModel,
+    train_loader: torch.utils.data.DataLoader,
+    test_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    epochs: int,
+    lr: float,
+    logger: logging.Logger,
+) -> tuple[dict[str, float], list[dict[str, float]]]:
+    criterion = nn.CrossEntropyLoss()
+    optimizer = Adam(model.parameters(), lr=lr)
+
+    model.to(device)
+    best = {"accuracy": 0.0, "kappa": 0.0, "epoch": 0}
+    history: list[dict[str, float]] = []
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        n_samples = 0
+
+        for x, y, _ in train_loader:
+            x = x.to(device)
+            y = y.to(device)
+
+            logits, _ = model(x, lambda_=0.0)
+            loss = criterion(logits, y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            batch_size = x.size(0)
+            n_samples += batch_size
+            running_loss += loss.item() * batch_size
+
+        train_loss = running_loss / max(n_samples, 1)
+        test_metrics = evaluate(model, test_loader, device)
+        epoch_row = {
+            "epoch": float(epoch + 1),
+            "train_loss": float(train_loss),
+            "test_accuracy": test_metrics["accuracy"],
+            "test_kappa": test_metrics["kappa"],
+        }
+        history.append(epoch_row)
+
+        if test_metrics["accuracy"] >= best["accuracy"]:
+            best = {
+                "accuracy": test_metrics["accuracy"],
+                "kappa": test_metrics["kappa"],
+                "epoch": float(epoch + 1),
+            }
+
+        logger.info(
+            "epoch=%d | train_loss=%.4f | test_acc=%.4f | test_kappa=%.4f",
+            epoch + 1,
+            train_loss,
+            test_metrics["accuracy"],
+            test_metrics["kappa"],
+        )
+
+    return best, history
+
+
+def run(args: argparse.Namespace) -> None:
+    set_seed_everywhere(args.seed, deterministic=args.deterministic)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = Path(args.output_dir) / f"{args.dataset}_{timestamp}"
+    ckpt_dir = run_dir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = setup_logger(run_dir)
+    logger.info("Loading MOABB dataset: %s", args.dataset)
+
+    x, y, subject_ids, subjects = load_moabb_motor_imagery_dataset(
+        dataset_name=args.dataset,
+        data_path=args.data_path,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_channels = x.shape[1]
+    num_classes = int(np.max(y)) + 1
+
+    logger.info(
+        "Loaded data shape=%s, n_subjects=%d, n_classes=%d, device=%s",
+        str(tuple(x.shape)),
+        len(subjects),
+        num_classes,
+        device,
+    )
+
+    selected_subjects = subjects
+    if args.subjects:
+        requested = {int(s) for s in args.subjects}
+        selected_subjects = [s for s in subjects if s in requested]
+
+    if not selected_subjects:
+        raise ValueError("No valid subjects selected")
+
+    all_results: dict[str, dict[str, float]] = {}
+
+    config = {
+        "dataset": args.dataset,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "test_size": args.test_size,
+        "seed": args.seed,
+        "deterministic": args.deterministic,
+        "subjects": selected_subjects,
+    }
+    with (run_dir / "config.json").open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+
+    metadata = create_experiment_metadata(
+        protocol="within_subject",
+        dataset=args.dataset,
+        config=config,
+        seed=args.seed,
+        deterministic=args.deterministic,
+    )
+    save_experiment_metadata(run_dir / "metadata.json", metadata)
+
+    for subject in selected_subjects:
+        logger.info("=== Subject %d ===", subject)
+
+        train_loader, test_loader = create_within_subject_dataloaders(
+            x=x,
+            y=y,
+            subject_id=subject_ids,
+            target_subject=subject,
+            batch_size=args.batch_size,
+            test_size=args.test_size,
+            random_state=args.seed,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            deterministic=args.deterministic,
+        )
+
+        model = EEGModel(
+            num_channels=num_channels,
+            num_classes=num_classes,
+            num_subjects=1,
+            cnn_out_channels=args.cnn_out_channels,
+            embedding_dim=args.embedding_dim,
+            num_heads=args.num_heads,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+        )
+
+        best, history = train_one_subject(
+            model=model,
+            train_loader=train_loader,
+            test_loader=test_loader,
+            device=device,
+            epochs=args.epochs,
+            lr=args.lr,
+            logger=logger,
+        )
+
+        subject_key = str(subject)
+        all_results[subject_key] = best
+
+        torch.save(model.state_dict(), ckpt_dir / f"subject_{subject}_last.pt")
+        with (run_dir / f"subject_{subject}_history.json").open(
+            "w", encoding="utf-8"
+        ) as f:
+            json.dump(history, f, indent=2)
+
+    accuracies = [v["accuracy"] for v in all_results.values()]
+    kappas = [v["kappa"] for v in all_results.values()]
+
+    summary = {
+        "dataset": args.dataset,
+        "n_subjects": len(all_results),
+        "mean_accuracy": float(np.mean(accuracies)),
+        "std_accuracy": float(np.std(accuracies)),
+        "mean_kappa": float(np.mean(kappas)),
+        "std_kappa": float(np.std(kappas)),
+        "per_subject": all_results,
+    }
+
+    with (run_dir / "within_subject_results.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    logger.info(
+        "Done. mean_acc=%.4f, std_acc=%.4f, results=%s",
+        summary["mean_accuracy"],
+        summary["std_accuracy"],
+        str(run_dir / "within_subject_results.json"),
+    )
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Within-subject training/evaluation on MOABB motor imagery datasets"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="bnci2014_001",
+        choices=["bnci2014_001", "physionetmi", "cho2017", "lee2019_mi"],
+    )
+    parser.add_argument("--data_path", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, default="results/within_subject")
+    parser.add_argument("--subjects", nargs="*", type=int, default=None)
+
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--test_size", type=float, default=0.2)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--deterministic", action="store_true", default=True)
+    parser.add_argument("--no-deterministic", dest="deterministic", action="store_false")
+
+    parser.add_argument("--cnn_out_channels", type=int, default=32)
+    parser.add_argument("--embedding_dim", type=int, default=128)
+    parser.add_argument("--num_heads", type=int, default=4)
+    parser.add_argument("--num_layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.1)
+
+    return parser
+
+
+if __name__ == "__main__":
+    run(build_arg_parser().parse_args())
