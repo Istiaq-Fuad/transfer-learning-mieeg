@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -257,6 +257,225 @@ def create_within_subject_dataloaders(
     return train_loader, test_loader
 
 
+def create_loso_domain_adaptation_dataloaders(
+    x: np.ndarray,
+    y: np.ndarray,
+    subject_id: np.ndarray,
+    target_subject: int,
+    batch_size: int = 32,
+    apply_euclidean_align: bool = True,
+    align_eps: float = 1e-6,
+    drop_last_train: bool = False,
+    num_workers: int = 0,
+    seed: Optional[int] = None,
+    deterministic: bool = True,
+) -> tuple[DataLoader, DataLoader, DataLoader]:
+    """
+    Build LOSO loaders for adversarial DA.
+
+    Source loader: all non-target-subject trials with labels.
+    Target train loader: target-subject trials (labels ignored during training).
+    Test loader: target-subject trials for evaluation.
+    """
+    source_mask = subject_id != target_subject
+    target_mask = subject_id == target_subject
+
+    if int(source_mask.sum()) == 0:
+        raise ValueError(
+            f"No source samples found when target_subject={target_subject}"
+        )
+    if int(target_mask.sum()) == 0:
+        raise ValueError(f"Target subject {target_subject} not found")
+
+    source_dataset = EEGDataset(
+        x[source_mask],
+        y[source_mask],
+        np.zeros(int(source_mask.sum()), dtype=np.int64),
+    )
+    target_train_dataset = EEGDataset(
+        x[target_mask],
+        y[target_mask],
+        np.ones(int(target_mask.sum()), dtype=np.int64),
+    )
+    target_test_dataset = EEGDataset(
+        x[target_mask],
+        y[target_mask],
+        np.ones(int(target_mask.sum()), dtype=np.int64),
+    )
+
+    if apply_euclidean_align:
+        whitening = fit_euclidean_alignment(source_dataset.x, eps=align_eps)
+        source_dataset.x = apply_euclidean_alignment(source_dataset.x, whitening)
+        target_train_dataset.x = apply_euclidean_alignment(
+            target_train_dataset.x, whitening
+        )
+        target_test_dataset.x = apply_euclidean_alignment(
+            target_test_dataset.x, whitening
+        )
+
+    generator = None
+    if seed is not None and deterministic:
+        generator = build_torch_generator(seed)
+
+    source_loader = DataLoader(
+        source_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=drop_last_train,
+        num_workers=num_workers,
+        generator=generator,
+    )
+    target_train_loader = DataLoader(
+        target_train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=drop_last_train,
+        num_workers=num_workers,
+        generator=generator,
+    )
+    target_test_loader = DataLoader(
+        target_test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+    return source_loader, target_train_loader, target_test_loader
+
+
+def create_within_subject_domain_adaptation_dataloaders(
+    x: np.ndarray,
+    y: np.ndarray,
+    subject_id: np.ndarray,
+    session_id: np.ndarray,
+    target_subject: int,
+    target_session: Optional[int] = None,
+    batch_size: int = 32,
+    target_test_size: float = 0.2,
+    random_state: int = 42,
+    apply_euclidean_align: bool = True,
+    align_eps: float = 1e-6,
+    drop_last_train: bool = False,
+    num_workers: int = 0,
+    seed: Optional[int] = None,
+    deterministic: bool = True,
+) -> tuple[DataLoader, DataLoader, DataLoader, int]:
+    """
+    Build within-subject DA loaders by splitting domains with session IDs.
+
+    Source loader: selected subject, all sessions except target session.
+    Target train loader: target session (unlabeled in training).
+    Test loader: held-out subset from target session.
+    """
+    mask = subject_id == target_subject
+    if int(mask.sum()) == 0:
+        raise ValueError(f"Subject {target_subject} not found")
+
+    x_sub = x[mask]
+    y_sub = y[mask]
+    s_sub = session_id[mask]
+
+    sessions = np.unique(s_sub)
+    if sessions.shape[0] < 2:
+        raise ValueError(
+            f"Subject {target_subject} needs at least 2 sessions for DA, got {sessions.shape[0]}"
+        )
+
+    selected_target_session = int(sessions[-1])
+    if target_session is not None:
+        if int(target_session) not in {int(v) for v in sessions.tolist()}:
+            raise ValueError(
+                f"target_session={target_session} not found for subject {target_subject}"
+            )
+        selected_target_session = int(target_session)
+
+    source_mask = s_sub != selected_target_session
+    target_mask = s_sub == selected_target_session
+
+    if np.unique(y_sub[source_mask]).shape[0] < 2:
+        raise ValueError(
+            f"Source sessions for subject {target_subject} have fewer than 2 classes"
+        )
+    if np.unique(y_sub[target_mask]).shape[0] < 2:
+        raise ValueError(
+            f"Target session for subject {target_subject} has fewer than 2 classes"
+        )
+
+    target_indices = np.where(target_mask)[0]
+    target_train_idx, target_test_idx = train_test_split(
+        target_indices,
+        test_size=target_test_size,
+        random_state=random_state,
+        stratify=y_sub[target_mask],
+    )
+
+    source_dataset = EEGDataset(
+        x_sub[source_mask],
+        y_sub[source_mask],
+        np.zeros(int(source_mask.sum()), dtype=np.int64),
+    )
+    target_train_dataset = EEGDataset(
+        x_sub[target_train_idx],
+        y_sub[target_train_idx],
+        np.ones(target_train_idx.shape[0], dtype=np.int64),
+    )
+    target_test_dataset = EEGDataset(
+        x_sub[target_test_idx],
+        y_sub[target_test_idx],
+        np.ones(target_test_idx.shape[0], dtype=np.int64),
+    )
+
+    if apply_euclidean_align:
+        whitening = fit_euclidean_alignment(source_dataset.x, eps=align_eps)
+        source_dataset.x = apply_euclidean_alignment(source_dataset.x, whitening)
+        target_train_dataset.x = apply_euclidean_alignment(
+            target_train_dataset.x, whitening
+        )
+        target_test_dataset.x = apply_euclidean_alignment(
+            target_test_dataset.x, whitening
+        )
+
+    generator = None
+    if seed is not None and deterministic:
+        generator = build_torch_generator(seed)
+
+    source_loader = DataLoader(
+        source_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=drop_last_train,
+        num_workers=num_workers,
+        generator=generator,
+    )
+    target_train_loader = DataLoader(
+        target_train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=drop_last_train,
+        num_workers=num_workers,
+        generator=generator,
+    )
+    target_test_loader = DataLoader(
+        target_test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+    return (
+        source_loader,
+        target_train_loader,
+        target_test_loader,
+        selected_target_session,
+    )
+
+
+def _encode_meta_column(values: np.ndarray) -> tuple[np.ndarray, dict[str, int]]:
+    labels = [str(v) for v in values.tolist()]
+    uniq = sorted(set(labels))
+    mapping = {label: idx for idx, label in enumerate(uniq)}
+    encoded = np.asarray([mapping[label] for label in labels], dtype=np.int64)
+    return encoded, mapping
+
+
 def load_moabb_motor_imagery_dataset(
     dataset_name: str = "bnci2014_001",
     data_path: str | None = None,
@@ -266,7 +485,8 @@ def load_moabb_motor_imagery_dataset(
     fmin: float = 4.0,
     fmax: float = 40.0,
     subjects: Optional[list[int]] = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[int]]:
+    include_metadata: bool = False,
+) -> Any:
     """
     Load EEG data from MOABB MotorImagery paradigms.
 
@@ -323,7 +543,20 @@ def load_moabb_motor_imagery_dataset(
     y_int = np.asarray([label_map[label] for label in y], dtype=np.int64)
     s_int = meta["subject"].to_numpy(dtype=np.int64)
 
-    return x.astype(np.float32), y_int, s_int, selected_subjects
+    if not include_metadata:
+        return x.astype(np.float32), y_int, s_int, selected_subjects
+
+    metadata: dict[str, Any] = {}
+    if "session" in meta.columns:
+        session_id, session_map = _encode_meta_column(meta["session"].to_numpy())
+        metadata["session_id"] = session_id
+        metadata["session_map"] = session_map
+    if "run" in meta.columns:
+        run_id, run_map = _encode_meta_column(meta["run"].to_numpy())
+        metadata["run_id"] = run_id
+        metadata["run_map"] = run_map
+
+    return x.astype(np.float32), y_int, s_int, selected_subjects, metadata
 
 
 def subsample_train_trials_per_subject_class(
