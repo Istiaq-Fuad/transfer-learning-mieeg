@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 from datetime import datetime
@@ -10,7 +11,9 @@ import numpy as np
 import torch
 from sklearn.metrics import cohen_kappa_score
 from torch import nn
-from torch.optim import Adam
+from torch.nn.utils import clip_grad_norm_
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 try:
     from data.loader import (
@@ -97,13 +100,25 @@ def train_one_subject(
     device: torch.device,
     epochs: int,
     lr: float,
+    min_lr: float,
+    weight_decay: float,
+    label_smoothing: float,
+    grad_clip_norm: float,
+    early_stopping_patience: int,
+    selection_metric: str,
+    augment_noise_std: float,
+    augment_time_mask_ratio: float,
     logger: logging.Logger,
-) -> tuple[dict[str, float], list[dict[str, float]]]:
-    criterion = nn.CrossEntropyLoss()
-    optimizer = Adam(model.parameters(), lr=lr)
+) -> tuple[dict[str, float], list[dict[str, float]], dict[str, torch.Tensor] | None]:
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=max(epochs, 1), eta_min=min_lr)
 
     model.to(device)
     best = {"accuracy": 0.0, "kappa": 0.0, "epoch": 0}
+    best_state_dict: dict[str, torch.Tensor] | None = None
+    best_score = float("-inf")
+    stale_epochs = 0
     history: list[dict[str, float]] = []
 
     for epoch in range(epochs):
@@ -115,11 +130,33 @@ def train_one_subject(
             x = x.to(device)
             y = y.to(device)
 
+            if augment_noise_std > 0.0:
+                x = x + augment_noise_std * torch.randn_like(x)
+
+            if augment_time_mask_ratio > 0.0:
+                t = x.size(-1)
+                mask_len = max(1, int(round(t * augment_time_mask_ratio)))
+                mask_len = min(mask_len, t)
+                max_start = max(t - mask_len, 0)
+                mask_starts = torch.randint(
+                    low=0,
+                    high=max_start + 1,
+                    size=(x.size(0),),
+                    device=x.device,
+                )
+                apply_mask = torch.rand(x.size(0), device=x.device) < 0.5
+                for idx in range(x.size(0)):
+                    if apply_mask[idx]:
+                        start = int(mask_starts[idx].item())
+                        x[idx, :, start : start + mask_len] = 0.0
+
             logits, _ = model(x, lambda_=0.0)
             loss = criterion(logits, y)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if grad_clip_norm > 0.0:
+                clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             optimizer.step()
 
             batch_size = x.size(0)
@@ -128,30 +165,49 @@ def train_one_subject(
 
         train_loss = running_loss / max(n_samples, 1)
         test_metrics = evaluate(model, test_loader, device)
+        current_lr = optimizer.param_groups[0]["lr"]
+        scheduler.step()
         epoch_row = {
             "epoch": float(epoch + 1),
             "train_loss": float(train_loss),
             "test_accuracy": test_metrics["accuracy"],
             "test_kappa": test_metrics["kappa"],
+            "lr": float(current_lr),
         }
         history.append(epoch_row)
 
-        if test_metrics["accuracy"] >= best["accuracy"]:
+        current_score = test_metrics[selection_metric]
+        if current_score > best_score:
+            best_score = current_score
             best = {
                 "accuracy": test_metrics["accuracy"],
                 "kappa": test_metrics["kappa"],
                 "epoch": float(epoch + 1),
             }
+            best_state_dict = copy.deepcopy(model.state_dict())
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
 
         logger.info(
-            "epoch=%d | train_loss=%.4f | test_acc=%.4f | test_kappa=%.4f",
+            "epoch=%d | lr=%.6f | train_loss=%.4f | test_acc=%.4f | test_kappa=%.4f",
             epoch + 1,
+            current_lr,
             train_loss,
             test_metrics["accuracy"],
             test_metrics["kappa"],
         )
 
-    return best, history
+        if early_stopping_patience > 0 and stale_epochs >= early_stopping_patience:
+            logger.info(
+                "Early stopping at epoch=%d (no %s improvement for %d epochs)",
+                epoch + 1,
+                selection_metric,
+                early_stopping_patience,
+            )
+            break
+
+    return best, history, best_state_dict
 
 
 def run(args: argparse.Namespace) -> None:
@@ -197,7 +253,18 @@ def run(args: argparse.Namespace) -> None:
         "batch_size": args.batch_size,
         "epochs": args.epochs,
         "lr": args.lr,
+        "min_lr": args.min_lr,
+        "weight_decay": args.weight_decay,
+        "label_smoothing": args.label_smoothing,
+        "grad_clip_norm": args.grad_clip_norm,
+        "early_stopping_patience": args.early_stopping_patience,
+        "selection_metric": args.selection_metric,
+        "augment_noise_std": args.augment_noise_std,
+        "augment_time_mask_ratio": args.augment_time_mask_ratio,
         "test_size": args.test_size,
+        "loader_euclidean_align": args.loader_euclidean_align,
+        "model_euclidean_alignment": args.model_euclidean_alignment,
+        "model_riemannian_reweight": args.model_riemannian_reweight,
         "seed": args.seed,
         "deterministic": args.deterministic,
         "subjects": selected_subjects,
@@ -225,6 +292,7 @@ def run(args: argparse.Namespace) -> None:
             batch_size=args.batch_size,
             test_size=args.test_size,
             random_state=args.seed,
+            apply_euclidean_align=args.loader_euclidean_align,
             num_workers=args.num_workers,
             seed=args.seed,
             deterministic=args.deterministic,
@@ -235,25 +303,38 @@ def run(args: argparse.Namespace) -> None:
             num_classes=num_classes,
             num_subjects=1,
             cnn_out_channels=args.cnn_out_channels,
+            cnn_dropout=args.cnn_dropout,
             embedding_dim=args.embedding_dim,
             num_heads=args.num_heads,
             num_layers=args.num_layers,
             dropout=args.dropout,
+            apply_model_euclidean_alignment=args.model_euclidean_alignment,
+            apply_model_riemannian_reweight=args.model_riemannian_reweight,
         )
 
-        best, history = train_one_subject(
+        best, history, best_state_dict = train_one_subject(
             model=model,
             train_loader=train_loader,
             test_loader=test_loader,
             device=device,
             epochs=args.epochs,
             lr=args.lr,
+            min_lr=args.min_lr,
+            weight_decay=args.weight_decay,
+            label_smoothing=args.label_smoothing,
+            grad_clip_norm=args.grad_clip_norm,
+            early_stopping_patience=args.early_stopping_patience,
+            selection_metric=args.selection_metric,
+            augment_noise_std=args.augment_noise_std,
+            augment_time_mask_ratio=args.augment_time_mask_ratio,
             logger=logger,
         )
 
         subject_key = str(subject)
         all_results[subject_key] = best
 
+        if best_state_dict is not None:
+            torch.save(best_state_dict, ckpt_dir / f"subject_{subject}_best.pt")
         torch.save(model.state_dict(), ckpt_dir / f"subject_{subject}_last.pt")
         with (run_dir / f"subject_{subject}_history.json").open(
             "w", encoding="utf-8"
@@ -301,13 +382,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--min_lr", type=float, default=1e-5)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
+    parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0)
+    parser.add_argument("--early_stopping_patience", type=int, default=15)
+    parser.add_argument(
+        "--selection_metric",
+        type=str,
+        default="kappa",
+        choices=["accuracy", "kappa"],
+    )
+    parser.add_argument("--augment_noise_std", type=float, default=0.01)
+    parser.add_argument("--augment_time_mask_ratio", type=float, default=0.05)
     parser.add_argument("--test_size", type=float, default=0.2)
+    parser.add_argument("--loader_euclidean_align", action="store_true", default=True)
+    parser.add_argument(
+        "--no-loader-euclidean-align",
+        dest="loader_euclidean_align",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--model_euclidean_alignment", action="store_true", default=False
+    )
+    parser.add_argument(
+        "--model_riemannian_reweight", action="store_true", default=True
+    )
+    parser.add_argument(
+        "--no-model-riemannian-reweight",
+        dest="model_riemannian_reweight",
+        action="store_false",
+    )
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action="store_true", default=True)
-    parser.add_argument("--no-deterministic", dest="deterministic", action="store_false")
+    parser.add_argument(
+        "--no-deterministic", dest="deterministic", action="store_false"
+    )
 
     parser.add_argument("--cnn_out_channels", type=int, default=32)
+    parser.add_argument("--cnn_dropout", type=float, default=0.5)
     parser.add_argument("--embedding_dim", type=int, default=128)
     parser.add_argument("--num_heads", type=int, default=4)
     parser.add_argument("--num_layers", type=int, default=2)
@@ -318,3 +432,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     run(build_arg_parser().parse_args())
+
+
+# uv run training/within_subject.py \
+#   --dataset bnci2014_001 \
+#   --epochs 50 \
+#   --lr 1e-3 \
+#   --min_lr 1e-4 \
+#   --weight_decay 1e-4 \
+#   --label_smoothing 0.0 \
+#   --augment_noise_std 0.0 \
+#   --augment_time_mask_ratio 0.0 \
+#   --early_stopping_patience 0 \
+#   --selection_metric accuracy \
+#   --output_dir results/within_subject_tuned_v2

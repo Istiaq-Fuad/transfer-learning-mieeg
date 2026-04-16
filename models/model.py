@@ -19,15 +19,23 @@ class EEGModel(nn.Module):
         num_classes: int,
         num_subjects: int,
         cnn_out_channels: int = 32,
+        cnn_dropout: float = 0.5,
         embedding_dim: int = 128,
         num_heads: int = 4,
         num_layers: int = 2,
         dropout: float = 0.1,
+        apply_model_euclidean_alignment: bool = True,
+        apply_model_riemannian_reweight: bool = True,
     ) -> None:
         super().__init__()
 
+        self.apply_model_euclidean_alignment = apply_model_euclidean_alignment
+        self.apply_model_riemannian_reweight = apply_model_riemannian_reweight
+
         self.cnn = CNNBlock(
-            in_channels=num_channels, out_channels=cnn_out_channels, dropout=0.5
+            in_channels=num_channels,
+            out_channels=cnn_out_channels,
+            dropout=cnn_dropout,
         )
         self.tokenizer = EEGTokenizer(
             in_features=cnn_out_channels,
@@ -58,8 +66,10 @@ class EEGModel(nn.Module):
             task_output: (B, num_classes)
             domain_output: (B, num_subjects)
         """
-        x = euclidean_alignment(x)
-        x = riemannian_reweight(x)
+        if self.apply_model_euclidean_alignment:
+            x = euclidean_alignment(x)
+        if self.apply_model_riemannian_reweight:
+            x = riemannian_reweight(x)
 
         x = x.unsqueeze(1)  # (B, 1, C, T)
         x = self.cnn(x)  # (B, F, 1, T')

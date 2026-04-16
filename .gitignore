@@ -59,6 +59,4 @@ logs/
 # LibreOffice lock files
 .~lock.*
 
-results/
-
 graphify-out/cache/
