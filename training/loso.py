@@ -169,6 +169,7 @@ def train_one_fold_da(
     epochs: int,
     lr: float,
     domain_loss_weight: float,
+    da_lambda_gamma: float,
     logger: logging.Logger,
 ) -> tuple[dict[str, float], list[dict[str, float]]]:
     task_criterion = nn.CrossEntropyLoss()
@@ -181,7 +182,7 @@ def train_one_fold_da(
 
     for epoch in range(epochs):
         model.train()
-        lam = lambda_scheduler(epoch, epochs)
+        lam = lambda_scheduler(epoch, epochs, gamma=da_lambda_gamma)
         running_loss = 0.0
         running_task = 0.0
         running_domain = 0.0
@@ -294,6 +295,7 @@ def run(args: argparse.Namespace) -> None:
         "lr": args.lr,
         "use_da": args.use_da,
         "domain_loss_weight": args.domain_loss_weight,
+        "da_lambda_gamma": args.da_lambda_gamma,
         "seed": args.seed,
         "deterministic": args.deterministic,
         "subjects": selected_subjects,
@@ -362,6 +364,7 @@ def run(args: argparse.Namespace) -> None:
                 epochs=args.epochs,
                 lr=args.lr,
                 domain_loss_weight=args.domain_loss_weight,
+                da_lambda_gamma=args.da_lambda_gamma,
                 logger=logger,
             )
         else:
@@ -426,6 +429,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--use_da", action="store_true", default=False)
     parser.add_argument("--domain_loss_weight", type=float, default=1.0)
+    parser.add_argument("--da_lambda_gamma", type=float, default=10.0)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action="store_true", default=True)

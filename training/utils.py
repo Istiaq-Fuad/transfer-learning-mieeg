@@ -72,8 +72,12 @@ def riemannian_reweight(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return torch.matmul(cov_norm, x)
 
 
-def lambda_scheduler(epoch: int, max_epoch: int) -> float:
+def lambda_scheduler(
+    epoch: int,
+    max_epoch: int,
+    gamma: float = 10.0,
+) -> float:
     """DANN-style lambda schedule."""
     denom = max(max_epoch, 1)
     p = float(epoch) / float(denom)
-    return 2.0 / (1.0 + math.exp(-10.0 * p)) - 1.0
+    return 2.0 / (1.0 + math.exp(-gamma * p)) - 1.0

@@ -241,6 +241,7 @@ def train_one_subject_da(
     augment_noise_std: float,
     augment_time_mask_ratio: float,
     domain_loss_weight: float,
+    da_lambda_gamma: float,
     logger: logging.Logger,
 ) -> tuple[dict[str, float], list[dict[str, float]], dict[str, torch.Tensor] | None]:
     task_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
@@ -257,7 +258,7 @@ def train_one_subject_da(
 
     for epoch in range(epochs):
         model.train()
-        lam = lambda_scheduler(epoch, epochs)
+        lam = lambda_scheduler(epoch, epochs, gamma=da_lambda_gamma)
         running_total_loss = 0.0
         running_task_loss = 0.0
         running_domain_loss = 0.0
@@ -418,6 +419,7 @@ def run(args: argparse.Namespace) -> None:
         "augment_time_mask_ratio": args.augment_time_mask_ratio,
         "use_da": args.use_da,
         "domain_loss_weight": args.domain_loss_weight,
+        "da_lambda_gamma": args.da_lambda_gamma,
         "da_target_session": args.da_target_session,
         "test_size": args.test_size,
         "loader_euclidean_align": args.loader_euclidean_align,
@@ -512,6 +514,7 @@ def run(args: argparse.Namespace) -> None:
                 augment_noise_std=args.augment_noise_std,
                 augment_time_mask_ratio=args.augment_time_mask_ratio,
                 domain_loss_weight=args.domain_loss_weight,
+                da_lambda_gamma=args.da_lambda_gamma,
                 logger=logger,
             )
         else:
@@ -600,6 +603,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--augment_time_mask_ratio", type=float, default=0.05)
     parser.add_argument("--use_da", action="store_true", default=False)
     parser.add_argument("--domain_loss_weight", type=float, default=1.0)
+    parser.add_argument("--da_lambda_gamma", type=float, default=10.0)
     parser.add_argument("--da_target_session", type=int, default=None)
     parser.add_argument("--test_size", type=float, default=0.2)
     parser.add_argument("--loader_euclidean_align", action="store_true", default=True)
