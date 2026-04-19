@@ -62,7 +62,8 @@ def evaluate(
             x = x.to(device)
             y = y.to(device)
 
-            logits, _ = model(x, lambda_=0.0)
+            outputs = model(x, lambda_=0.0)
+            logits = outputs["task"]
             preds = logits.argmax(dim=1)
 
             total += y.size(0)

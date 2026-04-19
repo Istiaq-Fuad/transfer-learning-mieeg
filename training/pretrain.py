@@ -38,7 +38,9 @@ def pretrain(
             y = y.to(device)
             subject_id = subject_id.to(device)
 
-            task_out, domain_out = model(x, lam)
+            outputs = model(x, lam)
+            task_out = outputs["task"]
+            domain_out = outputs["domain"]
 
             task_loss = task_criterion(task_out, y)
             domain_loss = domain_criterion(domain_out, subject_id)

@@ -84,7 +84,8 @@ def evaluate(
         x = x.to(device)
         y = y.to(device)
 
-        logits, _ = model(x, lambda_=0.0)
+        outputs = model(x, lambda_=0.0)
+        logits = outputs["task"]
         preds = logits.argmax(dim=1)
 
         total += y.size(0)
@@ -164,7 +165,8 @@ def train_one_subject(
 
             x = _augment_batch(x, augment_noise_std, augment_time_mask_ratio)
 
-            logits, _ = model(x, lambda_=0.0)
+            outputs = model(x, lambda_=0.0)
+            logits = outputs["task"]
             loss = criterion(logits, y)
 
             optimizer.zero_grad(set_to_none=True)
@@ -242,6 +244,7 @@ def train_one_subject_da(
     augment_time_mask_ratio: float,
     domain_loss_weight: float,
     da_lambda_gamma: float,
+    cnn_domain_weight: float,
     logger: logging.Logger,
 ) -> tuple[dict[str, float], list[dict[str, float]], dict[str, torch.Tensor] | None]:
     task_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
@@ -262,6 +265,7 @@ def train_one_subject_da(
         running_total_loss = 0.0
         running_task_loss = 0.0
         running_domain_loss = 0.0
+        running_domain_cnn_loss = 0.0
         n_samples = 0
 
         for (x_s, y_s, d_s), (x_t, _, d_t) in zip(source_loader, cycle(target_loader)):
@@ -274,14 +278,29 @@ def train_one_subject_da(
             x_s = _augment_batch(x_s, augment_noise_std, augment_time_mask_ratio)
             x_t = _augment_batch(x_t, augment_noise_std, augment_time_mask_ratio)
 
-            task_logits, domain_src = model(x_s, lambda_=lam)
-            _, domain_tgt = model(x_t, lambda_=lam)
+            out_src = model(x_s, lambda_=lam)
+            out_tgt = model(x_t, lambda_=lam)
+
+            task_logits = out_src["task"]
+            domain_src = out_src["domain"]
+            domain_tgt = out_tgt["domain"]
 
             task_loss = task_criterion(task_logits, y_s)
             domain_loss = 0.5 * (
                 domain_criterion(domain_src, d_s) + domain_criterion(domain_tgt, d_t)
             )
-            total_loss = task_loss + domain_loss_weight * lam * domain_loss
+
+            domain_cnn_loss = torch.tensor(0.0, device=device)
+            if "domain_cnn" in out_src and "domain_cnn" in out_tgt:
+                domain_cnn_src = out_src["domain_cnn"]
+                domain_cnn_tgt = out_tgt["domain_cnn"]
+                domain_cnn_loss = 0.5 * (
+                    domain_criterion(domain_cnn_src, d_s)
+                    + domain_criterion(domain_cnn_tgt, d_t)
+                )
+
+            domain_total = domain_loss + cnn_domain_weight * domain_cnn_loss
+            total_loss = task_loss + domain_loss_weight * lam * domain_total
 
             optimizer.zero_grad(set_to_none=True)
             total_loss.backward()
@@ -294,10 +313,12 @@ def train_one_subject_da(
             running_total_loss += total_loss.item() * bs
             running_task_loss += task_loss.item() * bs
             running_domain_loss += domain_loss.item() * bs
+            running_domain_cnn_loss += domain_cnn_loss.item() * bs
 
         train_loss = running_total_loss / max(n_samples, 1)
         train_task_loss = running_task_loss / max(n_samples, 1)
         train_domain_loss = running_domain_loss / max(n_samples, 1)
+        train_domain_cnn_loss = running_domain_cnn_loss / max(n_samples, 1)
 
         test_metrics = evaluate(model, test_loader, device)
         current_lr = optimizer.param_groups[0]["lr"]
@@ -309,6 +330,7 @@ def train_one_subject_da(
             "train_loss": float(train_loss),
             "train_task_loss": float(train_task_loss),
             "train_domain_loss": float(train_domain_loss),
+            "train_domain_cnn_loss": float(train_domain_cnn_loss),
             "test_accuracy": test_metrics["accuracy"],
             "test_kappa": test_metrics["kappa"],
             "lr": float(current_lr),
@@ -329,13 +351,14 @@ def train_one_subject_da(
             stale_epochs += 1
 
         logger.info(
-            "epoch=%d | lambda=%.4f | lr=%.6f | train_loss=%.4f | task=%.4f | domain=%.4f | test_acc=%.4f | test_kappa=%.4f",
+            "epoch=%d | lambda=%.4f | lr=%.6f | train_loss=%.4f | task=%.4f | domain=%.4f | domain_cnn=%.4f | test_acc=%.4f | test_kappa=%.4f",
             epoch + 1,
             lam,
             current_lr,
             train_loss,
             train_task_loss,
             train_domain_loss,
+            train_domain_cnn_loss,
             test_metrics["accuracy"],
             test_metrics["kappa"],
         )
@@ -420,9 +443,20 @@ def run(args: argparse.Namespace) -> None:
         "use_da": args.use_da,
         "domain_loss_weight": args.domain_loss_weight,
         "da_lambda_gamma": args.da_lambda_gamma,
+        "temporal_kernels": args.temporal_kernels,
+        "multiscale_preserve_capacity": args.multiscale_preserve_capacity,
+        "use_attention_pool": args.use_attention_pool,
+        "attention_mix_init": args.attention_mix_init,
+        "learnable_attention_mix": args.learnable_attention_mix,
+        "domain_head_hidden_dim": args.domain_head_hidden_dim,
+        "domain_head_layers": args.domain_head_layers,
+        "domain_head_dropout": args.domain_head_dropout,
+        "use_cnn_domain_head": args.use_cnn_domain_head,
+        "cnn_domain_weight": args.cnn_domain_weight,
         "da_target_session": args.da_target_session,
         "test_size": args.test_size,
         "loader_euclidean_align": args.loader_euclidean_align,
+        "model_pre_align_only": args.model_pre_align_only,
         "model_euclidean_alignment": args.model_euclidean_alignment,
         "model_riemannian_reweight": args.model_riemannian_reweight,
         "seed": args.seed,
@@ -492,6 +526,19 @@ def run(args: argparse.Namespace) -> None:
             num_heads=args.num_heads,
             num_layers=args.num_layers,
             dropout=args.dropout,
+            temporal_kernels=(
+                tuple(args.temporal_kernels) if args.temporal_kernels else None
+            ),
+            multiscale_preserve_capacity=args.multiscale_preserve_capacity,
+            use_attention_pool=args.use_attention_pool,
+            attention_mix_init=args.attention_mix_init,
+            learnable_attention_mix=args.learnable_attention_mix,
+            domain_head_hidden_dim=args.domain_head_hidden_dim,
+            domain_head_layers=args.domain_head_layers,
+            domain_head_dropout=args.domain_head_dropout,
+            use_cnn_domain_head=args.use_cnn_domain_head,
+            cnn_domain_weight=args.cnn_domain_weight,
+            apply_model_pre_align_only=args.model_pre_align_only,
             apply_model_euclidean_alignment=args.model_euclidean_alignment,
             apply_model_riemannian_reweight=args.model_riemannian_reweight,
         )
@@ -515,6 +562,7 @@ def run(args: argparse.Namespace) -> None:
                 augment_time_mask_ratio=args.augment_time_mask_ratio,
                 domain_loss_weight=args.domain_loss_weight,
                 da_lambda_gamma=args.da_lambda_gamma,
+                cnn_domain_weight=args.cnn_domain_weight,
                 logger=logger,
             )
         else:
@@ -604,6 +652,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_da", action="store_true", default=False)
     parser.add_argument("--domain_loss_weight", type=float, default=1.0)
     parser.add_argument("--da_lambda_gamma", type=float, default=10.0)
+    parser.add_argument("--temporal_kernels", nargs="+", type=int, default=None)
+    parser.add_argument("--multiscale_preserve_capacity", action="store_true", default=False)
+    parser.add_argument("--use_attention_pool", action="store_true", default=False)
+    parser.add_argument("--attention_mix_init", type=float, default=0.5)
+    parser.add_argument("--learnable_attention_mix", action="store_true", default=False)
+    parser.add_argument("--domain_head_hidden_dim", type=int, default=0)
+    parser.add_argument("--domain_head_layers", type=int, default=1)
+    parser.add_argument("--domain_head_dropout", type=float, default=0.0)
+    parser.add_argument("--use_cnn_domain_head", action="store_true", default=False)
+    parser.add_argument("--cnn_domain_weight", type=float, default=0.0)
     parser.add_argument("--da_target_session", type=int, default=None)
     parser.add_argument("--test_size", type=float, default=0.2)
     parser.add_argument("--loader_euclidean_align", action="store_true", default=True)
@@ -614,6 +672,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model_euclidean_alignment", action="store_true", default=False
+    )
+    parser.add_argument(
+        "--no-model-euclidean-alignment",
+        dest="model_euclidean_alignment",
+        action="store_false",
+    )
+    parser.add_argument("--model_pre_align_only", action="store_true", default=False)
+    parser.add_argument(
+        "--no-model-pre-align-only",
+        dest="model_pre_align_only",
+        action="store_false",
     )
     parser.add_argument(
         "--model_riemannian_reweight", action="store_true", default=True

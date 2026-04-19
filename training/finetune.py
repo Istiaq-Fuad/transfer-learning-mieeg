@@ -56,7 +56,8 @@ def finetune(
             x = x.to(device)
             y = y.to(device)
 
-            task_out, _ = model(x, lambda_=0.0)
+            outputs = model(x, lambda_=0.0)
+            task_out = outputs["task"]
             task_loss = criterion(task_out, y)
 
             optimizer.zero_grad()
