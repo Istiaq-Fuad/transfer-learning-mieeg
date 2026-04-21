@@ -96,6 +96,10 @@ def evaluate(
     return {"accuracy": float(accuracy), "kappa": float(kappa)}
 
 
+def _state_dict_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {k: v.detach().cpu() for k, v in model.state_dict().items()}
+
+
 def train_one_fold(
     model: nn.Module,
     train_loader: torch.utils.data.DataLoader,
@@ -335,6 +339,7 @@ def run(args: argparse.Namespace) -> None:
         "cnn_domain_weight": args.cnn_domain_weight,
         "seed": args.seed,
         "deterministic": args.deterministic,
+        "checkpoint_mode": args.checkpoint_mode,
         "subjects": selected_subjects,
         "protocol": "LOSO",
     }
@@ -351,6 +356,7 @@ def run(args: argparse.Namespace) -> None:
     save_experiment_metadata(run_dir / "metadata.json", metadata)
 
     per_subject: dict[str, dict[str, float]] = {}
+    run_models: dict[str, dict[str, torch.Tensor]] = {}
 
     for held_out in selected_subjects:
         logger.info("=== LOSO held-out subject %d ===", held_out)
@@ -436,7 +442,11 @@ def run(args: argparse.Namespace) -> None:
         key = str(held_out)
         per_subject[key] = best
 
-        torch.save(model.state_dict(), ckpt_dir / f"loso_subject_{held_out}_last.pt")
+        if args.checkpoint_mode == "per_subject":
+            torch.save(model.state_dict(), ckpt_dir / f"loso_subject_{held_out}_last.pt")
+        elif args.checkpoint_mode == "single_file":
+            run_models[key] = _state_dict_cpu(model)
+
         with (run_dir / f"loso_subject_{held_out}_history.json").open(
             "w", encoding="utf-8"
         ) as f:
@@ -459,6 +469,17 @@ def run(args: argparse.Namespace) -> None:
     with (run_dir / "loso_results.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
+    if args.checkpoint_mode == "single_file":
+        torch.save(
+            {
+                "dataset": args.dataset,
+                "protocol": "LOSO",
+                "config": config,
+                "per_subject_state_dict": run_models,
+            },
+            ckpt_dir / "loso_run_models.pt",
+        )
+
     logger.info(
         "Done. mean_acc=%.4f, std_acc=%.4f, results=%s",
         summary["mean_accuracy"],
@@ -477,6 +498,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--data_path", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="results/loso")
+    parser.add_argument(
+        "--checkpoint_mode",
+        type=str,
+        default="per_subject",
+        choices=["per_subject", "single_file", "none"],
+    )
     parser.add_argument("--subjects", nargs="*", type=int, default=None)
 
     parser.add_argument("--epochs", type=int, default=30)

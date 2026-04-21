@@ -99,6 +99,10 @@ def evaluate(
     return {"accuracy": float(acc), "kappa": float(kappa)}
 
 
+def _state_dict_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {k: v.detach().cpu() for k, v in model.state_dict().items()}
+
+
 def _augment_batch(
     x: torch.Tensor,
     augment_noise_std: float,
@@ -426,6 +430,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("No valid subjects selected")
 
     all_results: dict[str, dict[str, float]] = {}
+    run_models_last: dict[str, dict[str, torch.Tensor]] = {}
+    run_models_best: dict[str, dict[str, torch.Tensor]] = {}
 
     config = {
         "dataset": args.dataset,
@@ -461,6 +467,7 @@ def run(args: argparse.Namespace) -> None:
         "model_riemannian_reweight": args.model_riemannian_reweight,
         "seed": args.seed,
         "deterministic": args.deterministic,
+        "checkpoint_mode": args.checkpoint_mode,
         "subjects": selected_subjects,
     }
     with (run_dir / "config.json").open("w", encoding="utf-8") as f:
@@ -587,9 +594,17 @@ def run(args: argparse.Namespace) -> None:
         subject_key = str(subject)
         all_results[subject_key] = best
 
-        if best_state_dict is not None:
-            torch.save(best_state_dict, ckpt_dir / f"subject_{subject}_best.pt")
-        torch.save(model.state_dict(), ckpt_dir / f"subject_{subject}_last.pt")
+        if args.checkpoint_mode == "per_subject":
+            if best_state_dict is not None:
+                torch.save(best_state_dict, ckpt_dir / f"subject_{subject}_best.pt")
+            torch.save(model.state_dict(), ckpt_dir / f"subject_{subject}_last.pt")
+        elif args.checkpoint_mode == "single_file":
+            if best_state_dict is not None:
+                run_models_best[subject_key] = {
+                    k: v.detach().cpu() for k, v in best_state_dict.items()
+                }
+            run_models_last[subject_key] = _state_dict_cpu(model)
+
         with (run_dir / f"subject_{subject}_history.json").open(
             "w", encoding="utf-8"
         ) as f:
@@ -611,6 +626,18 @@ def run(args: argparse.Namespace) -> None:
     with (run_dir / "within_subject_results.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
+    if args.checkpoint_mode == "single_file":
+        torch.save(
+            {
+                "dataset": args.dataset,
+                "protocol": "within_subject",
+                "config": config,
+                "per_subject_last_state_dict": run_models_last,
+                "per_subject_best_state_dict": run_models_best,
+            },
+            ckpt_dir / "within_subject_run_models.pt",
+        )
+
     logger.info(
         "Done. mean_acc=%.4f, std_acc=%.4f, results=%s",
         summary["mean_accuracy"],
@@ -631,6 +658,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--data_path", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="results/within_subject")
+    parser.add_argument(
+        "--checkpoint_mode",
+        type=str,
+        default="per_subject",
+        choices=["per_subject", "single_file", "none"],
+    )
     parser.add_argument("--subjects", nargs="*", type=int, default=None)
 
     parser.add_argument("--epochs", type=int, default=30)
