@@ -1,6 +1,23 @@
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
+import logging
+
+import pooch
+from pathlib import Path
+_orig_retrieve = pooch.retrieve
+
+def _patched_pooch_retrieve(url, known_hash, fname=None, path=None, **kwargs):
+    if path is not None and fname is not None:
+        p = Path(path) / fname
+        if p.exists() and p.stat().st_size > 1000000:
+            return str(p)
+    return _orig_retrieve(url, known_hash, fname=fname, path=path, **kwargs)
+
+pooch.retrieve = _patched_pooch_retrieve
+
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -476,6 +493,117 @@ def _encode_meta_column(values: np.ndarray) -> tuple[np.ndarray, dict[str, int]]
     return encoded, mapping
 
 
+def _mne_log_context(level: str | None):
+    if level is None:
+        return nullcontext()
+    try:
+        import mne
+
+    except ModuleNotFoundError:
+        return nullcontext()
+    return mne.use_log_level(level, add_frames=False)
+
+
+def _progress_iter(values: list[int], enabled: bool, desc: str):
+    if not enabled:
+        return values
+    try:
+        from tqdm.auto import tqdm
+    except ModuleNotFoundError:
+        return values
+    return tqdm(values, desc=desc, unit="subject")
+
+
+def _parse_log_level(level: str) -> int:
+    value = getattr(logging, level.upper(), None)
+    if not isinstance(value, int):
+        raise ValueError(f"Unsupported log level: {level}")
+    return value
+
+
+@contextmanager
+def _moabb_log_context(level: str | None):
+    if level is None:
+        yield
+        return
+
+    parsed = _parse_log_level(level)
+    logger_names = ("moabb", "moabb.datasets", "moabb.datasets.gigadb")
+    loggers = [logging.getLogger(name) for name in logger_names]
+    previous_levels = [logger.level for logger in loggers]
+
+    for logger in loggers:
+        logger.setLevel(parsed)
+
+    try:
+        yield
+    finally:
+        for logger, previous in zip(loggers, previous_levels):
+            logger.setLevel(previous)
+
+
+def _canonical_motor_imagery_label(label: Any) -> str:
+    text = str(label).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "left": "left_hand",
+        "left_hand": "left_hand",
+        "right": "right_hand",
+        "right_hand": "right_hand",
+    }
+    return aliases.get(text, text)
+
+
+def _select_left_right_trials(
+    x: np.ndarray,
+    y: np.ndarray,
+    meta: Any,
+    dataset_name: str,
+) -> tuple[np.ndarray, np.ndarray, Any]:
+    canonical = np.asarray([_canonical_motor_imagery_label(v) for v in y], dtype=object)
+    keep = np.isin(canonical, ["left_hand", "right_hand"])
+    if int(keep.sum()) == 0:
+        labels = sorted(set(canonical.tolist()))
+        raise ValueError(
+            f"Dataset {dataset_name} has no left/right-hand trials in this configuration. Available labels: {labels}"
+        )
+
+    x_lr = x[keep]
+    y_lr = canonical[keep]
+    meta_lr = meta.iloc[np.where(keep)[0]].reset_index(drop=True)
+
+    present = sorted(set(y_lr.tolist()))
+    if present != ["left_hand", "right_hand"]:
+        raise ValueError(
+            f"Dataset {dataset_name} does not contain both left and right classes after filtering: {present}"
+        )
+
+    return x_lr, y_lr, meta_lr
+
+
+def _canonicalize_labels(y: np.ndarray) -> np.ndarray:
+    return np.asarray([_canonical_motor_imagery_label(v) for v in y], dtype=object)
+
+
+def _flatten_paths(value: Any) -> list[Path]:
+    if isinstance(value, (str, Path)):
+        return [Path(value)]
+    if isinstance(value, (list, tuple, set)):
+        paths: list[Path] = []
+        for item in value:
+            paths.extend(_flatten_paths(item))
+        return paths
+    return []
+
+
+def _is_valid_mat_header(path: Path) -> bool:
+    try:
+        with path.open("rb") as f:
+            header = f.read(32)
+    except OSError:
+        return False
+    return header.startswith(b"MATLAB 5.0 MAT-file")
+
+
 def load_moabb_motor_imagery_dataset(
     dataset_name: str = "bnci2014_001",
     data_path: str | None = None,
@@ -485,7 +613,17 @@ def load_moabb_motor_imagery_dataset(
     fmin: float = 4.0,
     fmax: float = 40.0,
     subjects: Optional[list[int]] = None,
+    max_subjects: Optional[int] = None,
     include_metadata: bool = False,
+    mne_log_level: str | None = "WARNING",
+    moabb_log_level: str | None = "ERROR",
+    class_policy: str = "left_right",
+    show_progress: bool = True,
+    skip_failed_subjects: bool = False,
+    subject_load_retries: int = 0,
+    redownload_on_failure: bool = True,
+    redownload_once_per_subject: bool = True,
+    skip_known_failed_subjects: bool = False,
 ) -> Any:
     """
     Load EEG data from MOABB MotorImagery paradigms.
@@ -495,9 +633,45 @@ def load_moabb_motor_imagery_dataset(
         y: (N,) int64
         subject_id: (N,) int64
         subjects: available subject IDs
+
+    class_policy:
+        - "left_right": keep only left/right classes
+        - "all_mi": keep all motor-imagery classes from paradigm output
+
+    moabb_log_level:
+        - controls MOABB logger verbosity during dataset load
+        - default "ERROR" hides non-critical warnings
+
+    show_progress:
+        - when True, shows subject-level progress bar while loading
+
+    skip_failed_subjects:
+        - when True, subject-level load failures are logged and skipped
+
+    subject_load_retries:
+        - retries per subject before skipping/failing
+
+    redownload_on_failure:
+        - when True, try force-updating failing subject files before retry
+
+    redownload_once_per_subject:
+        - when True, each dataset/subject pair is force-redownloaded at most once
+          across runs (marker stored under MNE_DATA/.redownload_attempts)
+
+    skip_known_failed_subjects:
+        - when True, subjects marked as failed in a previous run are skipped
+          immediately to avoid repeated download attempts
+
+    max_subjects:
+        - if set, cap selected subjects to the first N available IDs
     """
     from moabb.datasets import BNCI2014_001, Cho2017, Lee2019_MI, PhysionetMI
     from moabb.paradigms import MotorImagery
+
+    try:
+        from moabb.paradigms import LeftRightImagery
+    except ImportError:
+        LeftRightImagery = None
 
     name = dataset_name.lower()
     if name in {"bnci2014_001", "bnci", "bci"}:
@@ -518,16 +692,35 @@ def load_moabb_motor_imagery_dataset(
 
         os.environ["MNE_DATA"] = data_path
 
-    paradigm = MotorImagery(
-        events=["left_hand", "right_hand"],
-        n_classes=2,
-        fmin=fmin,
-        fmax=fmax,
-        tmin=tmin,
-        tmax=tmax,
-        resample=resample,
-        channels=_COMMON_CHANNELS,
-    )
+    if class_policy == "all_mi":
+        paradigm = MotorImagery(
+            fmin=fmin,
+            fmax=fmax,
+            tmin=tmin,
+            tmax=tmax,
+            resample=resample,
+            channels=_COMMON_CHANNELS,
+        )
+    elif LeftRightImagery is not None:
+        paradigm = LeftRightImagery(
+            fmin=fmin,
+            fmax=fmax,
+            tmin=tmin,
+            tmax=tmax,
+            resample=resample,
+            channels=_COMMON_CHANNELS,
+        )
+    else:
+        paradigm = MotorImagery(
+            events=["left_hand", "right_hand"],
+            n_classes=2,
+            fmin=fmin,
+            fmax=fmax,
+            tmin=tmin,
+            tmax=tmax,
+            resample=resample,
+            channels=_COMMON_CHANNELS,
+        )
 
     available_subjects = [int(s) for s in dataset.subject_list]
     selected_subjects = available_subjects
@@ -536,11 +729,232 @@ def load_moabb_motor_imagery_dataset(
         selected_subjects = [s for s in available_subjects if s in wanted]
         if not selected_subjects:
             raise ValueError(f"No matching subjects found for dataset {dataset_name}")
+    if max_subjects is not None:
+        if int(max_subjects) <= 0:
+            raise ValueError("max_subjects must be > 0 when provided")
+        selected_subjects = selected_subjects[: int(max_subjects)]
+        if not selected_subjects:
+            raise ValueError(f"No subjects selected for dataset {dataset_name}")
+    if int(subject_load_retries) < 0:
+        raise ValueError("subject_load_retries must be >= 0")
 
-    x, y, meta = paradigm.get_data(dataset=dataset, subjects=selected_subjects)
+    loader_logger = logging.getLogger(__name__)
+    dataset_key = str(getattr(dataset, "code", dataset_name)).lower()
 
-    label_map = {label: idx for idx, label in enumerate(sorted(np.unique(y).tolist()))}
-    y_int = np.asarray([label_map[label] for label in y], dtype=np.int64)
+    marker_root = (
+        Path(data_path) / ".loader_markers"
+        if data_path
+        else Path.home() / ".cache" / "transfer-learning-bci-loader"
+    )
+    redownload_marker_dir = marker_root / "redownload_attempts"
+    failed_marker_dir = marker_root / "failed_subjects"
+
+    def _redownload_marker_path(sid: int) -> Path | None:
+        return redownload_marker_dir / f"{dataset_key}_subject_{int(sid)}.marker"
+
+    def _failed_marker_path(sid: int) -> Path:
+        return failed_marker_dir / f"{dataset_key}_subject_{int(sid)}.marker"
+
+    def _is_redownloadable_error(exc: Exception) -> bool:
+        if isinstance(exc, OSError):
+            return True
+        text = str(exc).lower()
+        return (
+            "input/output error" in text
+            or "i/o error" in text
+            or "file_hash" in text
+            or "errno 5" in text
+            or "unknown mat file type" in text
+            or "expecting matrix here" in text
+            or "mat file appears to be truncated" in text
+            or "not a mat file" in text
+        )
+
+    def _subject_data_paths(sid: int, force_update: bool = False) -> list[Path]:
+        if not hasattr(dataset, "data_path"):
+            return []
+        kwargs: dict[str, Any] = {"force_update": bool(force_update)}
+        if data_path is not None:
+            kwargs["path"] = data_path
+        try:
+            resolved = dataset.data_path(int(sid), **kwargs)
+        except TypeError:
+            # Older MOABB signatures may reject some kwargs.
+            kwargs.pop("force_update", None)
+            resolved = dataset.data_path(int(sid), **kwargs)
+        return _flatten_paths(resolved)
+
+    def _has_invalid_mat_files(sid: int) -> bool:
+        paths = _subject_data_paths(int(sid), force_update=False)
+        for p in paths:
+            if p.suffix.lower() != ".mat":
+                continue
+            if not p.exists() or not _is_valid_mat_header(p):
+                return True
+        return False
+
+    def _force_redownload_subject(sid: int) -> None:
+        if not redownload_on_failure:
+            return
+        marker = _redownload_marker_path(int(sid))
+        if marker is not None and marker.exists():
+            loader_logger.warning(
+                "Skipping force redownload for %s subject=%d (already attempted before)",
+                dataset_name,
+                int(sid),
+            )
+            return
+        _subject_data_paths(int(sid), force_update=True)
+        if marker is not None:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("attempted\n", encoding="utf-8")
+
+    def _mark_failed_subject(sid: int, error_text: str) -> None:
+        marker = _failed_marker_path(int(sid))
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(error_text + "\n", encoding="utf-8")
+
+    def _clear_failed_subject_marker(sid: int) -> None:
+        marker = _failed_marker_path(int(sid))
+        if marker.exists():
+            marker.unlink()
+
+    def _load_one_subject(sid: int) -> tuple[np.ndarray, np.ndarray, Any]:
+        attempts = int(subject_load_retries) + 1
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            if attempt == 0 and redownload_on_failure:
+                try:
+                    if _has_invalid_mat_files(int(sid)):
+                        loader_logger.warning(
+                            "Detected invalid MAT file for %s subject=%d; forcing redownload",
+                            dataset_name,
+                            int(sid),
+                        )
+                        _force_redownload_subject(int(sid))
+                except Exception as precheck_exc:
+                    loader_logger.warning(
+                        "MAT precheck failed for %s subject=%d: %s",
+                        dataset_name,
+                        int(sid),
+                        str(precheck_exc),
+                    )
+            try:
+                return paradigm.get_data(dataset=dataset, subjects=[int(sid)])
+            except Exception as exc:  # pragma: no cover
+                last_error = exc
+                has_retry = attempt < (attempts - 1)
+                if has_retry and _is_redownloadable_error(exc):
+                    try:
+                        _force_redownload_subject(int(sid))
+                        loader_logger.warning(
+                            "Retrying %s subject=%d after force redownload",
+                            dataset_name,
+                            int(sid),
+                        )
+                    except Exception as red_exc:
+                        loader_logger.warning(
+                            "Redownload failed for %s subject=%d: %s",
+                            dataset_name,
+                            int(sid),
+                            str(red_exc),
+                        )
+        if last_error is None:
+            raise RuntimeError(f"Unknown subject load error for {sid}")
+        raise last_error
+
+    with ExitStack() as stack:
+        stack.enter_context(_mne_log_context(mne_log_level))
+        stack.enter_context(_moabb_log_context(moabb_log_level))
+        load_per_subject = (
+            skip_failed_subjects
+            or (show_progress and len(selected_subjects) > 1)
+            or int(subject_load_retries) > 0
+            or bool(redownload_on_failure)
+            or bool(skip_known_failed_subjects)
+        )
+        if load_per_subject:
+            import pandas as pd
+
+            x_parts: list[np.ndarray] = []
+            y_parts: list[np.ndarray] = []
+            meta_parts: list[Any] = []
+            failed_subjects: list[int] = []
+
+            for sid in _progress_iter(
+                selected_subjects,
+                enabled=(show_progress and len(selected_subjects) > 1),
+                desc=f"Loading {dataset_name}",
+            ):
+                if skip_known_failed_subjects and _failed_marker_path(int(sid)).exists():
+                    failed_subjects.append(int(sid))
+                    loader_logger.warning(
+                        "Skipping %s subject=%d due to previous failure marker",
+                        dataset_name,
+                        int(sid),
+                    )
+                    continue
+                try:
+                    x_sid, y_sid, meta_sid = _load_one_subject(int(sid))
+                except Exception as exc:  # pragma: no cover
+                    if not skip_failed_subjects:
+                        raise
+                    failed_subjects.append(int(sid))
+                    _mark_failed_subject(int(sid), str(exc))
+                    loader_logger.warning(
+                        "Skipping %s subject=%d due to load error: %s",
+                        dataset_name,
+                        int(sid),
+                        str(exc),
+                    )
+                    continue
+                _clear_failed_subject_marker(int(sid))
+                x_parts.append(x_sid)
+                y_parts.append(np.asarray(y_sid))
+                meta_parts.append(meta_sid)
+
+            if not x_parts:
+                if failed_subjects:
+                    raise ValueError(
+                        f"Dataset {dataset_name} failed for all selected subjects: {failed_subjects}"
+                    )
+                raise ValueError(f"Dataset {dataset_name} returned no trials")
+            x = np.concatenate(x_parts, axis=0)
+            y = np.concatenate(y_parts, axis=0)
+            meta = pd.concat(meta_parts, axis=0, ignore_index=True)
+            if failed_subjects:
+                loader_logger.warning(
+                    "Loaded %s with %d skipped subjects: %s",
+                    dataset_name,
+                    len(failed_subjects),
+                    failed_subjects,
+                )
+        else:
+            x, y, meta = paradigm.get_data(dataset=dataset, subjects=selected_subjects)
+
+    if class_policy == "left_right":
+        x, y, meta = _select_left_right_trials(
+            x=x,
+            y=y,
+            meta=meta,
+            dataset_name=dataset_name,
+        )
+    elif class_policy == "all_mi":
+        y = _canonicalize_labels(y)
+        if int(x.shape[0]) == 0:
+            raise ValueError(f"Dataset {dataset_name} has no trials after loading")
+    else:
+        raise ValueError(
+            f"Unsupported class_policy={class_policy}. Use one of: left_right, all_mi"
+        )
+
+    selected_subjects = sorted(meta["subject"].astype(int).unique().tolist())
+    if class_policy == "left_right":
+        label_map = {"left_hand": 0, "right_hand": 1}
+    else:
+        classes = sorted(set(str(label) for label in y.tolist()))
+        label_map = {label: idx for idx, label in enumerate(classes)}
+    y_int = np.asarray([label_map[str(label)] for label in y], dtype=np.int64)
     s_int = meta["subject"].to_numpy(dtype=np.int64)
 
     if not include_metadata:

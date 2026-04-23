@@ -1,0 +1,20 @@
+{
+  "dataset": "bnci2014_001",
+  "n_subjects": 2,
+  "mean_accuracy": 0.5517241379310345,
+  "std_accuracy": 0.051724137931034475,
+  "mean_kappa": 0.10344827586206895,
+  "std_kappa": 0.10344827586206895,
+  "per_subject": {
+    "1": {
+      "accuracy": 0.603448275862069,
+      "kappa": 0.2068965517241379,
+      "epoch": 1.0
+    },
+    "2": {
+      "accuracy": 0.5,
+      "kappa": 0.0,
+      "epoch": 1.0
+    }
+  }
+}

@@ -74,3 +74,18 @@ class DomainHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.classifier(x)
+
+
+class SSLProjectionHead(nn.Module):
+    """Projection head for contrastive SSL objectives."""
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)

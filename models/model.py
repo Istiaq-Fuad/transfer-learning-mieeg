@@ -144,6 +144,7 @@ class EEGModel(nn.Module):
         output: dict[str, torch.Tensor] = {
             "task": task_output,
             "domain": domain_output,
+            "features": task_feature,
         }
         if cnn_domain_output is not None:
             output["domain_cnn"] = cnn_domain_output

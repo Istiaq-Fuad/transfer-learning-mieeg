@@ -19,7 +19,7 @@ dependencies = [
     "pyriemann>=0.7",
     # Scientific Computing
     "numpy>=1.24.0,<2.2.0",
-    "scipy>=1.14.0",
+    "scipy==1.14.1",
     "scikit-learn>=1.5.0",
     # Visualization
     "matplotlib>=3.9.0",

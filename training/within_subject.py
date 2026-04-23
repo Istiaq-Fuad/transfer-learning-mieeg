@@ -103,6 +103,51 @@ def _state_dict_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
     return {k: v.detach().cpu() for k, v in model.state_dict().items()}
 
 
+def _load_init_checkpoint(
+    model: nn.Module,
+    checkpoint_path: str,
+    device: torch.device,
+    logger: logging.Logger,
+) -> None:
+    try:
+        state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except TypeError:
+        state = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(state, dict):
+        raise ValueError(f"Unsupported checkpoint format at {checkpoint_path}")
+    if "state_dict" in state and isinstance(state["state_dict"], dict):
+        state = state["state_dict"]
+
+    model_state = model.state_dict()
+    filtered_state: dict[str, torch.Tensor] = {}
+    skipped_shape: list[str] = []
+    for key, value in state.items():
+        if key not in model_state:
+            continue
+        if model_state[key].shape != value.shape:
+            skipped_shape.append(key)
+            continue
+        filtered_state[key] = value
+
+    incompatible = model.load_state_dict(filtered_state, strict=False)
+    missing = list(incompatible.missing_keys)
+    unexpected = list(incompatible.unexpected_keys)
+    logger.info(
+        "Warm-started model from %s | loaded=%d | shape_skipped=%d | missing_keys=%d | unexpected_keys=%d",
+        checkpoint_path,
+        len(filtered_state),
+        len(skipped_shape),
+        len(missing),
+        len(unexpected),
+    )
+    if skipped_shape:
+        logger.info("Shape-mismatch key sample: %s", skipped_shape[:5])
+    if missing:
+        logger.info("Missing key sample: %s", missing[:5])
+    if unexpected:
+        logger.info("Unexpected key sample: %s", unexpected[:5])
+
+
 def _augment_batch(
     x: torch.Tensor,
     augment_noise_std: float,
@@ -395,11 +440,14 @@ def run(args: argparse.Namespace) -> None:
             dataset_name=args.dataset,
             data_path=args.data_path,
             include_metadata=True,
+            show_progress=True,
         )
     else:
         x, y, subject_ids, subjects = load_moabb_motor_imagery_dataset(
             dataset_name=args.dataset,
             data_path=args.data_path,
+            subjects=args.subjects if args.subjects else None,
+            show_progress=True,
         )
         metadata = {}
 
@@ -435,6 +483,7 @@ def run(args: argparse.Namespace) -> None:
 
     config = {
         "dataset": args.dataset,
+        "init_checkpoint": args.init_checkpoint,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
         "lr": args.lr,
@@ -550,6 +599,9 @@ def run(args: argparse.Namespace) -> None:
             apply_model_riemannian_reweight=args.model_riemannian_reweight,
         )
 
+        if args.init_checkpoint:
+            _load_init_checkpoint(model, args.init_checkpoint, device, logger)
+
         if args.use_da:
             best, history, best_state_dict = train_one_subject_da(
                 model=model,
@@ -657,6 +709,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["bnci2014_001", "physionetmi", "cho2017", "lee2019_mi"],
     )
     parser.add_argument("--data_path", type=str, default=None)
+    parser.add_argument("--init_checkpoint", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="results/within_subject")
     parser.add_argument(
         "--checkpoint_mode",
