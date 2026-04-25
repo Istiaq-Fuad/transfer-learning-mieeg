@@ -16,7 +16,12 @@ from torch.nn import functional as F
 from torch.optim import Adam
 
 try:
-    from data.loader import create_dataloaders, load_moabb_motor_imagery_dataset
+    from data.loader import (
+        DataLoaderOptions,
+        MoabbLoadOptions,
+        create_dataloaders,
+        load_moabb_motor_imagery_dataset,
+    )
     from models.heads import SSLProjectionHead
     from models.model import EEGModel
     from training.utils import lambda_scheduler
@@ -32,7 +37,12 @@ except ModuleNotFoundError:
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
 
-    from data.loader import create_dataloaders, load_moabb_motor_imagery_dataset
+    from data.loader import (
+        DataLoaderOptions,
+        MoabbLoadOptions,
+        create_dataloaders,
+        load_moabb_motor_imagery_dataset,
+    )
     from models.heads import SSLProjectionHead
     from models.model import EEGModel
     from training.utils import lambda_scheduler
@@ -241,14 +251,16 @@ def load_source_mix(
             x, y, subject_id, subjects = load_moabb_motor_imagery_dataset(
                 dataset_name=ds_name,
                 data_path=data_path,
-                class_policy=class_policy,
-                max_subjects=max_subjects_per_dataset,
-                show_progress=True,
-                skip_failed_subjects=skip_failed_subjects,
-                subject_load_retries=subject_load_retries,
-                redownload_on_failure=redownload_on_failure,
-                redownload_once_per_subject=redownload_once_per_subject,
-                skip_known_failed_subjects=skip_known_failed_subjects,
+                options=MoabbLoadOptions(
+                    class_policy=class_policy,
+                    max_subjects=max_subjects_per_dataset,
+                    show_progress=True,
+                    skip_failed_subjects=skip_failed_subjects,
+                    subject_load_retries=subject_load_retries,
+                    redownload_on_failure=redownload_on_failure,
+                    redownload_once_per_subject=redownload_once_per_subject,
+                    skip_known_failed_subjects=skip_known_failed_subjects,
+                ),
             )
         except Exception as exc:
             if not skip_failed_subjects:
@@ -386,14 +398,16 @@ def run(args: argparse.Namespace) -> None:
         x=x,
         y=y,
         subject_id=domain_id,
-        batch_size=args.batch_size,
-        test_size=args.val_split,
-        random_state=args.seed,
         loso_subject=None,
-        apply_euclidean_align=args.loader_euclidean_align,
-        num_workers=args.num_workers,
-        seed=args.seed,
-        deterministic=args.deterministic,
+        options=DataLoaderOptions(
+            batch_size=args.batch_size,
+            test_size=args.val_split,
+            random_state=args.seed,
+            apply_euclidean_align=args.loader_euclidean_align,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            deterministic=args.deterministic,
+        ),
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -15,6 +15,8 @@ from torch.optim import Adam
 
 try:
     from data.loader import (
+        DataLoaderOptions,
+        MoabbLoadOptions,
         create_dataloaders,
         create_loso_domain_adaptation_dataloaders,
         load_moabb_motor_imagery_dataset,
@@ -34,6 +36,8 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(PROJECT_ROOT))
 
     from data.loader import (
+        DataLoaderOptions,
+        MoabbLoadOptions,
         create_dataloaders,
         create_loso_domain_adaptation_dataloaders,
         load_moabb_motor_imagery_dataset,
@@ -337,8 +341,18 @@ def run(args: argparse.Namespace) -> None:
     x, y, subject_ids, subjects = load_moabb_motor_imagery_dataset(
         dataset_name=args.dataset,
         data_path=args.data_path,
-        subjects=args.subjects if args.subjects else None,
-        show_progress=True,
+        options=MoabbLoadOptions(
+            subjects=args.subjects if args.subjects else None,
+            show_progress=True,
+        ),
+    )
+
+    loader_options = DataLoaderOptions(
+        batch_size=args.batch_size,
+        apply_euclidean_align=args.loader_euclidean_align,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        deterministic=args.deterministic,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -416,11 +430,7 @@ def run(args: argparse.Namespace) -> None:
                     y=y,
                     subject_id=subject_ids,
                     target_subject=held_out,
-                    batch_size=args.batch_size,
-                    apply_euclidean_align=args.loader_euclidean_align,
-                    num_workers=args.num_workers,
-                    seed=args.seed,
-                    deterministic=args.deterministic,
+                    options=loader_options,
                 )
             )
         else:
@@ -428,12 +438,8 @@ def run(args: argparse.Namespace) -> None:
                 x=x,
                 y=y,
                 subject_id=subject_ids,
-                batch_size=args.batch_size,
                 loso_subject=held_out,
-                apply_euclidean_align=args.loader_euclidean_align,
-                num_workers=args.num_workers,
-                seed=args.seed,
-                deterministic=args.deterministic,
+                options=loader_options,
             )
 
         model = EEGModel(

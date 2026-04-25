@@ -61,7 +61,7 @@ datasets = [
 
 # ✅ Safe loader
 def load_one_subject(ds):
-    subj = ds.subject_list[0]
+    subj = ds.subject_list[-1]
 
     try:
         X, y, meta = paradigm.get_data(dataset=ds, subjects=[subj])

@@ -1,24 +1,12 @@
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 import logging
-
-import pooch
 from pathlib import Path
-_orig_retrieve = pooch.retrieve
-
-def _patched_pooch_retrieve(url, known_hash, fname=None, path=None, **kwargs):
-    if path is not None and fname is not None:
-        p = Path(path) / fname
-        if p.exists() and p.stat().st_size > 1000000:
-            return str(p)
-    return _orig_retrieve(url, known_hash, fname=fname, path=path, **kwargs)
-
-pooch.retrieve = _patched_pooch_retrieve
-
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
+from urllib.parse import unquote, urlparse
+import zipfile
 
 import numpy as np
 import torch
@@ -73,13 +61,91 @@ class SplitResult:
     test_dataset: EEGDataset
 
 
+@dataclass(frozen=True)
+class MoabbLoadOptions:
+    resample: int = 128
+    tmin: float = 0.0
+    tmax: float = 4.0
+    fmin: float = 4.0
+    fmax: float = 40.0
+    subjects: list[int] | None = None
+    max_subjects: int | None = None
+    include_metadata: bool = False
+    mne_log_level: str | None = "WARNING"
+    moabb_log_level: str | None = "ERROR"
+    class_policy: str = "left_right"
+    show_progress: bool = True
+    skip_failed_subjects: bool = False
+    subject_load_retries: int = 0
+    redownload_on_failure: bool = True
+    redownload_once_per_subject: bool = True
+    skip_known_failed_subjects: bool = False
+
+
+@dataclass(frozen=True)
+class DataLoaderOptions:
+    batch_size: int = 32
+    test_size: float = 0.2
+    target_test_size: float = 0.2
+    random_state: int = 42
+    apply_euclidean_align: bool = True
+    align_eps: float = 1e-6
+    subject_balanced_sampling: bool = False
+    drop_last_train: bool = False
+    num_workers: int = 0
+    seed: int | None = None
+    deterministic: bool = True
+
+
+def _resolve_moabb_load_options(
+    options: MoabbLoadOptions | None,
+    legacy_kwargs: dict[str, Any],
+) -> MoabbLoadOptions:
+    if options is None:
+        resolved = MoabbLoadOptions()
+    else:
+        resolved = options
+
+    if not legacy_kwargs:
+        return resolved
+
+    allowed = {f.name for f in fields(MoabbLoadOptions)}
+    unknown = sorted(set(legacy_kwargs) - allowed)
+    if unknown:
+        unknown_text = ", ".join(unknown)
+        raise TypeError(f"Unexpected load options: {unknown_text}")
+
+    return replace(resolved, **legacy_kwargs)
+
+
+def _resolve_data_loader_options(
+    options: DataLoaderOptions | None,
+    legacy_kwargs: dict[str, Any],
+    allowed_fields: set[str],
+) -> DataLoaderOptions:
+    if options is None:
+        resolved = DataLoaderOptions()
+    else:
+        resolved = options
+
+    if not legacy_kwargs:
+        return resolved
+
+    unknown = sorted(set(legacy_kwargs) - allowed_fields)
+    if unknown:
+        unknown_text = ", ".join(unknown)
+        raise TypeError(f"Unexpected dataloader options: {unknown_text}")
+
+    return replace(resolved, **legacy_kwargs)
+
+
 def split_eeg_data(
     x: np.ndarray,
     y: np.ndarray,
     subject_id: np.ndarray,
     test_size: float = 0.2,
     random_state: int = 42,
-    loso_subject: Optional[int] = None,
+    loso_subject: int | None = None,
 ) -> SplitResult:
     """Split EEG data with either random split or LOSO strategy."""
     if loso_subject is not None:
@@ -110,29 +176,38 @@ def create_dataloaders(
     x: np.ndarray,
     y: np.ndarray,
     subject_id: np.ndarray,
-    batch_size: int = 32,
-    test_size: float = 0.2,
-    random_state: int = 42,
-    loso_subject: Optional[int] = None,
-    apply_euclidean_align: bool = True,
-    align_eps: float = 1e-6,
-    subject_balanced_sampling: bool = False,
-    drop_last_train: bool = False,
-    num_workers: int = 0,
-    seed: Optional[int] = None,
-    deterministic: bool = True,
+    loso_subject: int | None = None,
+    options: DataLoaderOptions | None = None,
+    **legacy_options: Any,
 ) -> tuple[DataLoader, DataLoader]:
+    opts = _resolve_data_loader_options(
+        options,
+        legacy_options,
+        {
+            "batch_size",
+            "test_size",
+            "random_state",
+            "apply_euclidean_align",
+            "align_eps",
+            "subject_balanced_sampling",
+            "drop_last_train",
+            "num_workers",
+            "seed",
+            "deterministic",
+        },
+    )
+
     split = split_eeg_data(
         x=x,
         y=y,
         subject_id=subject_id,
-        test_size=test_size,
-        random_state=random_state,
+        test_size=opts.test_size,
+        random_state=opts.random_state,
         loso_subject=loso_subject,
     )
 
-    if apply_euclidean_align:
-        whitening = fit_euclidean_alignment(split.train_dataset.x, eps=align_eps)
+    if opts.apply_euclidean_align:
+        whitening = fit_euclidean_alignment(split.train_dataset.x, eps=opts.align_eps)
         split.train_dataset.x = apply_euclidean_alignment(
             split.train_dataset.x, whitening
         )
@@ -141,12 +216,12 @@ def create_dataloaders(
         )
 
     train_generator = None
-    if seed is not None and deterministic:
-        train_generator = build_torch_generator(seed)
+    if opts.seed is not None and opts.deterministic:
+        train_generator = build_torch_generator(opts.seed)
 
     train_sampler = None
     train_shuffle = True
-    if subject_balanced_sampling:
+    if opts.subject_balanced_sampling:
         sid = split.train_dataset.subject_id
         unique_sid, counts = sid.unique(return_counts=True)
         if unique_sid.numel() > 1:
@@ -168,18 +243,18 @@ def create_dataloaders(
 
     train_loader = DataLoader(
         split.train_dataset,
-        batch_size=batch_size,
+        batch_size=opts.batch_size,
         shuffle=train_shuffle,
         sampler=train_sampler,
-        drop_last=drop_last_train,
-        num_workers=num_workers,
+        drop_last=opts.drop_last_train,
+        num_workers=opts.num_workers,
         generator=train_generator,
     )
     test_loader = DataLoader(
         split.test_dataset,
-        batch_size=batch_size,
+        batch_size=opts.batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=opts.num_workers,
     )
     return train_loader, test_loader
 
@@ -189,18 +264,27 @@ def create_within_subject_dataloaders(
     y: np.ndarray,
     subject_id: np.ndarray,
     target_subject: int,
-    batch_size: int = 32,
-    test_size: float = 0.2,
-    random_state: int = 42,
-    apply_euclidean_align: bool = True,
-    align_eps: float = 1e-6,
-    subject_balanced_sampling: bool = False,
-    drop_last_train: bool = False,
-    num_workers: int = 0,
-    seed: Optional[int] = None,
-    deterministic: bool = True,
+    options: DataLoaderOptions | None = None,
+    **legacy_options: Any,
 ) -> tuple[DataLoader, DataLoader]:
     """Create train/test loaders from one subject only."""
+    opts = _resolve_data_loader_options(
+        options,
+        legacy_options,
+        {
+            "batch_size",
+            "test_size",
+            "random_state",
+            "apply_euclidean_align",
+            "align_eps",
+            "subject_balanced_sampling",
+            "drop_last_train",
+            "num_workers",
+            "seed",
+            "deterministic",
+        },
+    )
+
     mask = subject_id == target_subject
     if int(mask.sum()) == 0:
         raise ValueError(f"Subject {target_subject} not found")
@@ -217,26 +301,26 @@ def create_within_subject_dataloaders(
     indices = np.arange(len(x_sub))
     train_idx, test_idx = train_test_split(
         indices,
-        test_size=test_size,
-        random_state=random_state,
+        test_size=opts.test_size,
+        random_state=opts.random_state,
         stratify=y_sub,
     )
 
     train_dataset = EEGDataset(x_sub[train_idx], y_sub[train_idx], s_sub[train_idx])
     test_dataset = EEGDataset(x_sub[test_idx], y_sub[test_idx], s_sub[test_idx])
 
-    if apply_euclidean_align:
-        whitening = fit_euclidean_alignment(train_dataset.x, eps=align_eps)
+    if opts.apply_euclidean_align:
+        whitening = fit_euclidean_alignment(train_dataset.x, eps=opts.align_eps)
         train_dataset.x = apply_euclidean_alignment(train_dataset.x, whitening)
         test_dataset.x = apply_euclidean_alignment(test_dataset.x, whitening)
 
     train_generator = None
-    if seed is not None and deterministic:
-        train_generator = build_torch_generator(seed)
+    if opts.seed is not None and opts.deterministic:
+        train_generator = build_torch_generator(opts.seed)
 
     train_sampler = None
     train_shuffle = True
-    if subject_balanced_sampling:
+    if opts.subject_balanced_sampling:
         sid = train_dataset.subject_id
         unique_sid, counts = sid.unique(return_counts=True)
         if unique_sid.numel() > 1:
@@ -258,18 +342,18 @@ def create_within_subject_dataloaders(
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=opts.batch_size,
         shuffle=train_shuffle,
         sampler=train_sampler,
-        drop_last=drop_last_train,
-        num_workers=num_workers,
+        drop_last=opts.drop_last_train,
+        num_workers=opts.num_workers,
         generator=train_generator,
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=batch_size,
+        batch_size=opts.batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=opts.num_workers,
     )
     return train_loader, test_loader
 
@@ -279,13 +363,8 @@ def create_loso_domain_adaptation_dataloaders(
     y: np.ndarray,
     subject_id: np.ndarray,
     target_subject: int,
-    batch_size: int = 32,
-    apply_euclidean_align: bool = True,
-    align_eps: float = 1e-6,
-    drop_last_train: bool = False,
-    num_workers: int = 0,
-    seed: Optional[int] = None,
-    deterministic: bool = True,
+    options: DataLoaderOptions | None = None,
+    **legacy_options: Any,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
     Build LOSO loaders for adversarial DA.
@@ -294,6 +373,20 @@ def create_loso_domain_adaptation_dataloaders(
     Target train loader: target-subject trials (labels ignored during training).
     Test loader: target-subject trials for evaluation.
     """
+    opts = _resolve_data_loader_options(
+        options,
+        legacy_options,
+        {
+            "batch_size",
+            "apply_euclidean_align",
+            "align_eps",
+            "drop_last_train",
+            "num_workers",
+            "seed",
+            "deterministic",
+        },
+    )
+
     source_mask = subject_id != target_subject
     target_mask = subject_id == target_subject
 
@@ -320,8 +413,8 @@ def create_loso_domain_adaptation_dataloaders(
         np.ones(int(target_mask.sum()), dtype=np.int64),
     )
 
-    if apply_euclidean_align:
-        whitening = fit_euclidean_alignment(source_dataset.x, eps=align_eps)
+    if opts.apply_euclidean_align:
+        whitening = fit_euclidean_alignment(source_dataset.x, eps=opts.align_eps)
         source_dataset.x = apply_euclidean_alignment(source_dataset.x, whitening)
         target_train_dataset.x = apply_euclidean_alignment(
             target_train_dataset.x, whitening
@@ -331,30 +424,30 @@ def create_loso_domain_adaptation_dataloaders(
         )
 
     generator = None
-    if seed is not None and deterministic:
-        generator = build_torch_generator(seed)
+    if opts.seed is not None and opts.deterministic:
+        generator = build_torch_generator(opts.seed)
 
     source_loader = DataLoader(
         source_dataset,
-        batch_size=batch_size,
+        batch_size=opts.batch_size,
         shuffle=True,
-        drop_last=drop_last_train,
-        num_workers=num_workers,
+        drop_last=opts.drop_last_train,
+        num_workers=opts.num_workers,
         generator=generator,
     )
     target_train_loader = DataLoader(
         target_train_dataset,
-        batch_size=batch_size,
+        batch_size=opts.batch_size,
         shuffle=True,
-        drop_last=drop_last_train,
-        num_workers=num_workers,
+        drop_last=opts.drop_last_train,
+        num_workers=opts.num_workers,
         generator=generator,
     )
     target_test_loader = DataLoader(
         target_test_dataset,
-        batch_size=batch_size,
+        batch_size=opts.batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=opts.num_workers,
     )
     return source_loader, target_train_loader, target_test_loader
 
@@ -365,16 +458,9 @@ def create_within_subject_domain_adaptation_dataloaders(
     subject_id: np.ndarray,
     session_id: np.ndarray,
     target_subject: int,
-    target_session: Optional[int] = None,
-    batch_size: int = 32,
-    target_test_size: float = 0.2,
-    random_state: int = 42,
-    apply_euclidean_align: bool = True,
-    align_eps: float = 1e-6,
-    drop_last_train: bool = False,
-    num_workers: int = 0,
-    seed: Optional[int] = None,
-    deterministic: bool = True,
+    target_session: int | None = None,
+    options: DataLoaderOptions | None = None,
+    **legacy_options: Any,
 ) -> tuple[DataLoader, DataLoader, DataLoader, int]:
     """
     Build within-subject DA loaders by splitting domains with session IDs.
@@ -383,6 +469,22 @@ def create_within_subject_domain_adaptation_dataloaders(
     Target train loader: target session (unlabeled in training).
     Test loader: held-out subset from target session.
     """
+    opts = _resolve_data_loader_options(
+        options,
+        legacy_options,
+        {
+            "batch_size",
+            "target_test_size",
+            "random_state",
+            "apply_euclidean_align",
+            "align_eps",
+            "drop_last_train",
+            "num_workers",
+            "seed",
+            "deterministic",
+        },
+    )
+
     mask = subject_id == target_subject
     if int(mask.sum()) == 0:
         raise ValueError(f"Subject {target_subject} not found")
@@ -420,8 +522,8 @@ def create_within_subject_domain_adaptation_dataloaders(
     target_indices = np.where(target_mask)[0]
     target_train_idx, target_test_idx = train_test_split(
         target_indices,
-        test_size=target_test_size,
-        random_state=random_state,
+        test_size=opts.target_test_size,
+        random_state=opts.random_state,
         stratify=y_sub[target_mask],
     )
 
@@ -441,8 +543,8 @@ def create_within_subject_domain_adaptation_dataloaders(
         np.ones(target_test_idx.shape[0], dtype=np.int64),
     )
 
-    if apply_euclidean_align:
-        whitening = fit_euclidean_alignment(source_dataset.x, eps=align_eps)
+    if opts.apply_euclidean_align:
+        whitening = fit_euclidean_alignment(source_dataset.x, eps=opts.align_eps)
         source_dataset.x = apply_euclidean_alignment(source_dataset.x, whitening)
         target_train_dataset.x = apply_euclidean_alignment(
             target_train_dataset.x, whitening
@@ -452,30 +554,30 @@ def create_within_subject_domain_adaptation_dataloaders(
         )
 
     generator = None
-    if seed is not None and deterministic:
-        generator = build_torch_generator(seed)
+    if opts.seed is not None and opts.deterministic:
+        generator = build_torch_generator(opts.seed)
 
     source_loader = DataLoader(
         source_dataset,
-        batch_size=batch_size,
+        batch_size=opts.batch_size,
         shuffle=True,
-        drop_last=drop_last_train,
-        num_workers=num_workers,
+        drop_last=opts.drop_last_train,
+        num_workers=opts.num_workers,
         generator=generator,
     )
     target_train_loader = DataLoader(
         target_train_dataset,
-        batch_size=batch_size,
+        batch_size=opts.batch_size,
         shuffle=True,
-        drop_last=drop_last_train,
-        num_workers=num_workers,
+        drop_last=opts.drop_last_train,
+        num_workers=opts.num_workers,
         generator=generator,
     )
     target_test_loader = DataLoader(
         target_test_dataset,
-        batch_size=batch_size,
+        batch_size=opts.batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=opts.num_workers,
     )
     return (
         source_loader,
@@ -595,6 +697,30 @@ def _flatten_paths(value: Any) -> list[Path]:
     return []
 
 
+def _configure_moabb_data_path(data_path: str | None) -> str | None:
+    if data_path is None:
+        return None
+
+    import os
+
+    resolved = str(Path(data_path).expanduser().resolve())
+    os.environ["MNE_DATA"] = resolved
+    os.environ["MOABB_DATA_PATH"] = resolved
+    os.environ["MNE_DATASETS_BNCI_PATH"] = resolved
+    os.environ["MNE_DATASETS_EEGBCI_PATH"] = resolved
+    os.environ["MNE_DATASETS_GIGADB_PATH"] = resolved
+    os.environ["MNE_DATASETS_LEE2019_MI_PATH"] = resolved
+
+    try:
+        import mne
+
+        mne.set_config("MNE_DATA", resolved, set_env=True)
+    except Exception:
+        pass
+
+    return resolved
+
+
 def _is_valid_mat_header(path: Path) -> bool:
     try:
         with path.open("rb") as f:
@@ -604,26 +730,106 @@ def _is_valid_mat_header(path: Path) -> bool:
     return header.startswith(b"MATLAB 5.0 MAT-file")
 
 
+def _is_cached_download_valid(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        if path.stat().st_size <= 0:
+            return False
+    except OSError:
+        return False
+
+    suffix = path.suffix.lower()
+    if suffix == ".mat":
+        return _is_valid_mat_header(path)
+    if suffix == ".zip":
+        return zipfile.is_zipfile(path)
+    return True
+
+
+def _infer_hash_algorithm(expected_hash: str) -> str | None:
+    length = len(expected_hash)
+    if length == 32:
+        return "md5"
+    if length == 40:
+        return "sha1"
+    if length == 64:
+        return "sha256"
+    return None
+
+
+def _hash_matches(path: Path, known_hash: str | None) -> bool:
+    if not known_hash:
+        return True
+
+    text = str(known_hash).strip()
+    if not text or text.lower() == "unverified":
+        return True
+
+    expected = text.lower()
+    if ":" in expected:
+        algorithm, expected = expected.split(":", 1)
+    else:
+        inferred = _infer_hash_algorithm(expected)
+        if inferred is None:
+            return True
+        algorithm = inferred
+
+    try:
+        import pooch
+    except ModuleNotFoundError:
+        return True
+
+    try:
+        computed = pooch.file_hash(path, alg=algorithm).lower()
+    except Exception:
+        return False
+    return computed == expected
+
+
+@contextmanager
+def _cache_first_pooch_retrieve_context():
+    try:
+        import pooch
+    except ModuleNotFoundError:
+        yield {"enabled": False}
+        return
+
+    original_retrieve = pooch.retrieve
+    allow_cache_reuse = {"enabled": True}
+
+    def _patched_retrieve(url, known_hash, fname=None, path=None, **kwargs):
+        if allow_cache_reuse["enabled"] and path is not None:
+            candidate: Path | None = None
+            if fname is not None:
+                candidate = Path(path) / str(fname)
+            else:
+                parsed = urlparse(str(url))
+                basename = Path(unquote(parsed.path)).name
+                if basename:
+                    candidate = Path(path) / basename
+
+            if (
+                candidate is not None
+                and _is_cached_download_valid(candidate)
+                and _hash_matches(candidate, known_hash)
+            ):
+                return str(candidate)
+
+        return original_retrieve(url, known_hash, fname=fname, path=path, **kwargs)
+
+    pooch.retrieve = _patched_retrieve
+    try:
+        yield allow_cache_reuse
+    finally:
+        pooch.retrieve = original_retrieve
+
+
 def load_moabb_motor_imagery_dataset(
     dataset_name: str = "bnci2014_001",
     data_path: str | None = None,
-    resample: int = 128,
-    tmin: float = 0.0,
-    tmax: float = 4.0,
-    fmin: float = 4.0,
-    fmax: float = 40.0,
-    subjects: Optional[list[int]] = None,
-    max_subjects: Optional[int] = None,
-    include_metadata: bool = False,
-    mne_log_level: str | None = "WARNING",
-    moabb_log_level: str | None = "ERROR",
-    class_policy: str = "left_right",
-    show_progress: bool = True,
-    skip_failed_subjects: bool = False,
-    subject_load_retries: int = 0,
-    redownload_on_failure: bool = True,
-    redownload_once_per_subject: bool = True,
-    skip_known_failed_subjects: bool = False,
+    options: MoabbLoadOptions | None = None,
+    **legacy_options: Any,
 ) -> Any:
     """
     Load EEG data from MOABB MotorImagery paradigms.
@@ -634,37 +840,16 @@ def load_moabb_motor_imagery_dataset(
         subject_id: (N,) int64
         subjects: available subject IDs
 
-    class_policy:
-        - "left_right": keep only left/right classes
-        - "all_mi": keep all motor-imagery classes from paradigm output
+    options:
+        - compact configuration object for MOABB loading.
+        - use `MoabbLoadOptions(...)` to override defaults.
 
-    moabb_log_level:
-        - controls MOABB logger verbosity during dataset load
-        - default "ERROR" hides non-critical warnings
-
-    show_progress:
-        - when True, shows subject-level progress bar while loading
-
-    skip_failed_subjects:
-        - when True, subject-level load failures are logged and skipped
-
-    subject_load_retries:
-        - retries per subject before skipping/failing
-
-    redownload_on_failure:
-        - when True, try force-updating failing subject files before retry
-
-    redownload_once_per_subject:
-        - when True, each dataset/subject pair is force-redownloaded at most once
-          across runs (marker stored under MNE_DATA/.redownload_attempts)
-
-    skip_known_failed_subjects:
-        - when True, subjects marked as failed in a previous run are skipped
-          immediately to avoid repeated download attempts
-
-    max_subjects:
-        - if set, cap selected subjects to the first N available IDs
+    legacy_options:
+        - backward-compatible keyword overrides for `MoabbLoadOptions` fields.
     """
+    opts = _resolve_moabb_load_options(options, legacy_options)
+    class_policy = opts.class_policy
+
     from moabb.datasets import BNCI2014_001, Cho2017, Lee2019_MI, PhysionetMI
     from moabb.paradigms import MotorImagery
 
@@ -687,63 +872,61 @@ def load_moabb_motor_imagery_dataset(
             "Unsupported dataset_name. Use one of: bnci2014_001, physionetmi, cho2017, lee2019_mi"
         )
 
-    if data_path:
-        import os
+    resolved_data_path = _configure_moabb_data_path(data_path)
 
-        os.environ["MNE_DATA"] = data_path
-
-    if class_policy == "all_mi":
+    if opts.class_policy == "all_mi":
         paradigm = MotorImagery(
-            fmin=fmin,
-            fmax=fmax,
-            tmin=tmin,
-            tmax=tmax,
-            resample=resample,
+            fmin=opts.fmin,
+            fmax=opts.fmax,
+            tmin=opts.tmin,
+            tmax=opts.tmax,
+            resample=opts.resample,
             channels=_COMMON_CHANNELS,
         )
     elif LeftRightImagery is not None:
         paradigm = LeftRightImagery(
-            fmin=fmin,
-            fmax=fmax,
-            tmin=tmin,
-            tmax=tmax,
-            resample=resample,
+            fmin=opts.fmin,
+            fmax=opts.fmax,
+            tmin=opts.tmin,
+            tmax=opts.tmax,
+            resample=opts.resample,
             channels=_COMMON_CHANNELS,
         )
     else:
         paradigm = MotorImagery(
             events=["left_hand", "right_hand"],
             n_classes=2,
-            fmin=fmin,
-            fmax=fmax,
-            tmin=tmin,
-            tmax=tmax,
-            resample=resample,
+            fmin=opts.fmin,
+            fmax=opts.fmax,
+            tmin=opts.tmin,
+            tmax=opts.tmax,
+            resample=opts.resample,
             channels=_COMMON_CHANNELS,
         )
 
     available_subjects = [int(s) for s in dataset.subject_list]
     selected_subjects = available_subjects
-    if subjects is not None:
-        wanted = {int(s) for s in subjects}
+    if opts.subjects is not None:
+        wanted = {int(s) for s in opts.subjects}
         selected_subjects = [s for s in available_subjects if s in wanted]
         if not selected_subjects:
             raise ValueError(f"No matching subjects found for dataset {dataset_name}")
-    if max_subjects is not None:
-        if int(max_subjects) <= 0:
+    if opts.max_subjects is not None:
+        if int(opts.max_subjects) <= 0:
             raise ValueError("max_subjects must be > 0 when provided")
-        selected_subjects = selected_subjects[: int(max_subjects)]
+        selected_subjects = selected_subjects[: int(opts.max_subjects)]
         if not selected_subjects:
             raise ValueError(f"No subjects selected for dataset {dataset_name}")
-    if int(subject_load_retries) < 0:
+    if int(opts.subject_load_retries) < 0:
         raise ValueError("subject_load_retries must be >= 0")
 
     loader_logger = logging.getLogger(__name__)
     dataset_key = str(getattr(dataset, "code", dataset_name)).lower()
+    cache_reuse_control: dict[str, bool] = {"enabled": True}
 
     marker_root = (
-        Path(data_path) / ".loader_markers"
-        if data_path
+        Path(resolved_data_path) / ".loader_markers"
+        if resolved_data_path
         else Path.home() / ".cache" / "transfer-learning-bci-loader"
     )
     redownload_marker_dir = marker_root / "redownload_attempts"
@@ -773,39 +956,36 @@ def load_moabb_motor_imagery_dataset(
     def _subject_data_paths(sid: int, force_update: bool = False) -> list[Path]:
         if not hasattr(dataset, "data_path"):
             return []
-        kwargs: dict[str, Any] = {"force_update": bool(force_update)}
-        if data_path is not None:
-            kwargs["path"] = data_path
+        kwargs: dict[str, Any] = {}
+        if force_update:
+            kwargs["force_update"] = True
+        if resolved_data_path is not None:
+            kwargs["path"] = resolved_data_path
         try:
             resolved = dataset.data_path(int(sid), **kwargs)
         except TypeError:
-            # Older MOABB signatures may reject some kwargs.
             kwargs.pop("force_update", None)
             resolved = dataset.data_path(int(sid), **kwargs)
         return _flatten_paths(resolved)
 
-    def _has_invalid_mat_files(sid: int) -> bool:
-        paths = _subject_data_paths(int(sid), force_update=False)
-        for p in paths:
-            if p.suffix.lower() != ".mat":
-                continue
-            if not p.exists() or not _is_valid_mat_header(p):
-                return True
-        return False
-
     def _force_redownload_subject(sid: int) -> None:
-        if not redownload_on_failure:
+        if not opts.redownload_on_failure:
             return
         marker = _redownload_marker_path(int(sid))
-        if marker is not None and marker.exists():
+        if opts.redownload_once_per_subject and marker is not None and marker.exists():
             loader_logger.warning(
                 "Skipping force redownload for %s subject=%d (already attempted before)",
                 dataset_name,
                 int(sid),
             )
             return
-        _subject_data_paths(int(sid), force_update=True)
-        if marker is not None:
+        previous_reuse = cache_reuse_control.get("enabled", True)
+        cache_reuse_control["enabled"] = False
+        try:
+            _subject_data_paths(int(sid), force_update=True)
+        finally:
+            cache_reuse_control["enabled"] = previous_reuse
+        if opts.redownload_once_per_subject and marker is not None:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text("attempted\n", encoding="utf-8")
 
@@ -820,31 +1000,15 @@ def load_moabb_motor_imagery_dataset(
             marker.unlink()
 
     def _load_one_subject(sid: int) -> tuple[np.ndarray, np.ndarray, Any]:
-        attempts = int(subject_load_retries) + 1
+        attempts = int(opts.subject_load_retries) + 1
         last_error: Exception | None = None
         for attempt in range(attempts):
-            if attempt == 0 and redownload_on_failure:
-                try:
-                    if _has_invalid_mat_files(int(sid)):
-                        loader_logger.warning(
-                            "Detected invalid MAT file for %s subject=%d; forcing redownload",
-                            dataset_name,
-                            int(sid),
-                        )
-                        _force_redownload_subject(int(sid))
-                except Exception as precheck_exc:
-                    loader_logger.warning(
-                        "MAT precheck failed for %s subject=%d: %s",
-                        dataset_name,
-                        int(sid),
-                        str(precheck_exc),
-                    )
             try:
                 return paradigm.get_data(dataset=dataset, subjects=[int(sid)])
             except Exception as exc:  # pragma: no cover
                 last_error = exc
                 has_retry = attempt < (attempts - 1)
-                if has_retry and _is_redownloadable_error(exc):
+                if has_retry and _is_redownloadable_error(exc) and opts.redownload_on_failure:
                     try:
                         _force_redownload_subject(int(sid))
                         loader_logger.warning(
@@ -864,14 +1028,15 @@ def load_moabb_motor_imagery_dataset(
         raise last_error
 
     with ExitStack() as stack:
-        stack.enter_context(_mne_log_context(mne_log_level))
-        stack.enter_context(_moabb_log_context(moabb_log_level))
+        cache_reuse_control = stack.enter_context(_cache_first_pooch_retrieve_context())
+        stack.enter_context(_mne_log_context(opts.mne_log_level))
+        stack.enter_context(_moabb_log_context(opts.moabb_log_level))
         load_per_subject = (
-            skip_failed_subjects
-            or (show_progress and len(selected_subjects) > 1)
-            or int(subject_load_retries) > 0
-            or bool(redownload_on_failure)
-            or bool(skip_known_failed_subjects)
+            opts.skip_failed_subjects
+            or int(opts.subject_load_retries) > 0
+            or bool(opts.redownload_on_failure)
+            or bool(opts.skip_known_failed_subjects)
+            or (opts.show_progress and len(selected_subjects) > 1)
         )
         if load_per_subject:
             import pandas as pd
@@ -883,10 +1048,13 @@ def load_moabb_motor_imagery_dataset(
 
             for sid in _progress_iter(
                 selected_subjects,
-                enabled=(show_progress and len(selected_subjects) > 1),
+                enabled=(opts.show_progress and len(selected_subjects) > 1),
                 desc=f"Loading {dataset_name}",
             ):
-                if skip_known_failed_subjects and _failed_marker_path(int(sid)).exists():
+                if (
+                    opts.skip_known_failed_subjects
+                    and _failed_marker_path(int(sid)).exists()
+                ):
                     failed_subjects.append(int(sid))
                     loader_logger.warning(
                         "Skipping %s subject=%d due to previous failure marker",
@@ -897,7 +1065,7 @@ def load_moabb_motor_imagery_dataset(
                 try:
                     x_sid, y_sid, meta_sid = _load_one_subject(int(sid))
                 except Exception as exc:  # pragma: no cover
-                    if not skip_failed_subjects:
+                    if not opts.skip_failed_subjects:
                         raise
                     failed_subjects.append(int(sid))
                     _mark_failed_subject(int(sid), str(exc))
@@ -957,7 +1125,7 @@ def load_moabb_motor_imagery_dataset(
     y_int = np.asarray([label_map[str(label)] for label in y], dtype=np.int64)
     s_int = meta["subject"].to_numpy(dtype=np.int64)
 
-    if not include_metadata:
+    if not opts.include_metadata:
         return x.astype(np.float32), y_int, s_int, selected_subjects
 
     metadata: dict[str, Any] = {}

@@ -18,6 +18,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 try:
     from data.loader import (
+        DataLoaderOptions,
+        MoabbLoadOptions,
         create_within_subject_domain_adaptation_dataloaders,
         create_within_subject_dataloaders,
         load_moabb_motor_imagery_dataset,
@@ -36,6 +38,8 @@ except ModuleNotFoundError:
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
     from data.loader import (
+        DataLoaderOptions,
+        MoabbLoadOptions,
         create_within_subject_domain_adaptation_dataloaders,
         create_within_subject_dataloaders,
         load_moabb_motor_imagery_dataset,
@@ -439,17 +443,40 @@ def run(args: argparse.Namespace) -> None:
         x, y, subject_ids, subjects, metadata = load_moabb_motor_imagery_dataset(
             dataset_name=args.dataset,
             data_path=args.data_path,
-            include_metadata=True,
-            show_progress=True,
+            options=MoabbLoadOptions(
+                include_metadata=True,
+                show_progress=True,
+            ),
         )
     else:
         x, y, subject_ids, subjects = load_moabb_motor_imagery_dataset(
             dataset_name=args.dataset,
             data_path=args.data_path,
-            subjects=args.subjects if args.subjects else None,
-            show_progress=True,
+            options=MoabbLoadOptions(
+                subjects=args.subjects if args.subjects else None,
+                show_progress=True,
+            ),
         )
         metadata = {}
+
+    train_loader_options = DataLoaderOptions(
+        batch_size=args.batch_size,
+        test_size=args.test_size,
+        random_state=args.seed,
+        apply_euclidean_align=args.loader_euclidean_align,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        deterministic=args.deterministic,
+    )
+    da_loader_options = DataLoaderOptions(
+        batch_size=args.batch_size,
+        target_test_size=args.test_size,
+        random_state=args.seed,
+        apply_euclidean_align=args.loader_euclidean_align,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        deterministic=args.deterministic,
+    )
 
     session_ids = metadata.get("session_id")
     if args.use_da and session_ids is None:
@@ -543,13 +570,7 @@ def run(args: argparse.Namespace) -> None:
                     session_id=session_ids,
                     target_subject=subject,
                     target_session=args.da_target_session,
-                    batch_size=args.batch_size,
-                    target_test_size=args.test_size,
-                    random_state=args.seed,
-                    apply_euclidean_align=args.loader_euclidean_align,
-                    num_workers=args.num_workers,
-                    seed=args.seed,
-                    deterministic=args.deterministic,
+                    options=da_loader_options,
                 )
             )
             logger.info(
@@ -563,13 +584,7 @@ def run(args: argparse.Namespace) -> None:
                 y=y,
                 subject_id=subject_ids,
                 target_subject=subject,
-                batch_size=args.batch_size,
-                test_size=args.test_size,
-                random_state=args.seed,
-                apply_euclidean_align=args.loader_euclidean_align,
-                num_workers=args.num_workers,
-                seed=args.seed,
-                deterministic=args.deterministic,
+                options=train_loader_options,
             )
 
         model = EEGModel(

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import yaml
 
-from data.loader import create_dataloaders
+from data.loader import DataLoaderOptions, create_dataloaders
 from models.model import EEGModel
 from training.finetune import finetune
 from training.pretrain import pretrain
@@ -93,10 +93,12 @@ def main() -> None:
         x=x,
         y=y,
         subject_id=subject_id,
-        batch_size=cfg.batch_size,
         loso_subject=cfg.loso_subject,
-        seed=cfg.seed,
-        deterministic=cfg.deterministic,
+        options=DataLoaderOptions(
+            batch_size=cfg.batch_size,
+            seed=cfg.seed,
+            deterministic=cfg.deterministic,
+        ),
     )
 
     num_channels = x.shape[1]
