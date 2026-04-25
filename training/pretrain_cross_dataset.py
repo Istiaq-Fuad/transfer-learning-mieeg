@@ -224,11 +224,8 @@ def load_source_mix(
     class_policy: str,
     require_two_classes: bool,
     max_subjects_per_dataset: int | None,
-    skip_failed_subjects: bool,
     subject_load_retries: int,
     redownload_on_failure: bool,
-    redownload_once_per_subject: bool,
-    skip_known_failed_subjects: bool,
     logger: logging.Logger,
 ) -> tuple[
     np.ndarray,
@@ -255,20 +252,12 @@ def load_source_mix(
                     class_policy=class_policy,
                     max_subjects=max_subjects_per_dataset,
                     show_progress=True,
-                    skip_failed_subjects=skip_failed_subjects,
                     subject_load_retries=subject_load_retries,
                     redownload_on_failure=redownload_on_failure,
-                    redownload_once_per_subject=redownload_once_per_subject,
-                    skip_known_failed_subjects=skip_known_failed_subjects,
                 ),
             )
         except Exception as exc:
-            if not skip_failed_subjects:
-                raise
-            reason = str(exc)
-            skipped.append({"dataset": ds_name, "reason": reason})
-            logger.warning("Skipping %s: %s", ds_name, reason)
-            continue
+            raise RuntimeError(f"Failed loading {ds_name}: {exc}") from exc
 
         present_labels = sorted(np.unique(y).tolist())
         if require_two_classes and len(present_labels) < 2:
@@ -383,11 +372,8 @@ def run(args: argparse.Namespace) -> None:
         class_policy=class_policy,
         require_two_classes=require_two_classes,
         max_subjects_per_dataset=args.max_subjects_per_dataset,
-        skip_failed_subjects=args.skip_failed_subjects,
         subject_load_retries=args.subject_load_retries,
         redownload_on_failure=args.redownload_on_failure,
-        redownload_once_per_subject=args.redownload_once_per_subject,
-        skip_known_failed_subjects=args.skip_known_failed_subjects,
         logger=logger,
     )
 
@@ -491,11 +477,8 @@ def run(args: argparse.Namespace) -> None:
         "num_workers": args.num_workers,
         "data_path": args.data_path,
         "max_subjects_per_dataset": args.max_subjects_per_dataset,
-        "skip_failed_subjects": args.skip_failed_subjects,
         "subject_load_retries": args.subject_load_retries,
         "redownload_on_failure": args.redownload_on_failure,
-        "redownload_once_per_subject": args.redownload_once_per_subject,
-        "skip_known_failed_subjects": args.skip_known_failed_subjects,
         "ssl_temperature": args.ssl_temperature,
         "ssl_proj_dim": args.ssl_proj_dim,
         "ssl_hidden_dim": args.ssl_hidden_dim,
@@ -752,29 +735,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", type=str, default="results/pretrain_cross_dataset")
     parser.add_argument("--tag", type=str, default="")
     parser.add_argument("--max_subjects_per_dataset", type=int, default=None)
-    parser.add_argument("--skip_failed_subjects", action="store_true", default=True)
-    parser.add_argument(
-        "--no-skip-failed-subjects",
-        dest="skip_failed_subjects",
-        action="store_false",
-    )
     parser.add_argument("--subject_load_retries", type=int, default=1)
     parser.add_argument("--redownload_on_failure", action="store_true", default=True)
     parser.add_argument(
         "--no-redownload-on-failure",
         dest="redownload_on_failure",
-        action="store_false",
-    )
-    parser.add_argument("--redownload_once_per_subject", action="store_true", default=True)
-    parser.add_argument(
-        "--no-redownload-once-per-subject",
-        dest="redownload_once_per_subject",
-        action="store_false",
-    )
-    parser.add_argument("--skip_known_failed_subjects", action="store_true", default=True)
-    parser.add_argument(
-        "--no-skip-known-failed-subjects",
-        dest="skip_known_failed_subjects",
         action="store_false",
     )
     parser.add_argument(

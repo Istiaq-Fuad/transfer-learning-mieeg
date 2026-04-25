@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
+import warnings
 import zipfile
 
 import numpy as np
@@ -71,15 +72,12 @@ class MoabbLoadOptions:
     subjects: list[int] | None = None
     max_subjects: int | None = None
     include_metadata: bool = False
-    mne_log_level: str | None = "WARNING"
+    mne_log_level: str | None = "ERROR"
     moabb_log_level: str | None = "ERROR"
     class_policy: str = "left_right"
     show_progress: bool = True
-    skip_failed_subjects: bool = False
     subject_load_retries: int = 0
     redownload_on_failure: bool = True
-    redownload_once_per_subject: bool = True
-    skip_known_failed_subjects: bool = False
 
 
 @dataclass(frozen=True)
@@ -744,6 +742,18 @@ def _is_cached_download_valid(path: Path) -> bool:
         return _is_valid_mat_header(path)
     if suffix == ".zip":
         return zipfile.is_zipfile(path)
+    if suffix == ".edf":
+        try:
+            with path.open("rb") as f:
+                return f.read(8) == b"0       "
+        except OSError:
+            return False
+    if suffix == ".gdf":
+        try:
+            with path.open("rb") as f:
+                return f.read(3) == b"GDF"
+        except OSError:
+            return False
     return True
 
 
@@ -924,20 +934,6 @@ def load_moabb_motor_imagery_dataset(
     dataset_key = str(getattr(dataset, "code", dataset_name)).lower()
     cache_reuse_control: dict[str, bool] = {"enabled": True}
 
-    marker_root = (
-        Path(resolved_data_path) / ".loader_markers"
-        if resolved_data_path
-        else Path.home() / ".cache" / "transfer-learning-bci-loader"
-    )
-    redownload_marker_dir = marker_root / "redownload_attempts"
-    failed_marker_dir = marker_root / "failed_subjects"
-
-    def _redownload_marker_path(sid: int) -> Path | None:
-        return redownload_marker_dir / f"{dataset_key}_subject_{int(sid)}.marker"
-
-    def _failed_marker_path(sid: int) -> Path:
-        return failed_marker_dir / f"{dataset_key}_subject_{int(sid)}.marker"
-
     def _is_redownloadable_error(exc: Exception) -> bool:
         if isinstance(exc, OSError):
             return True
@@ -971,40 +967,43 @@ def load_moabb_motor_imagery_dataset(
     def _force_redownload_subject(sid: int) -> None:
         if not opts.redownload_on_failure:
             return
-        marker = _redownload_marker_path(int(sid))
-        if opts.redownload_once_per_subject and marker is not None and marker.exists():
-            loader_logger.warning(
-                "Skipping force redownload for %s subject=%d (already attempted before)",
-                dataset_name,
-                int(sid),
-            )
-            return
         previous_reuse = cache_reuse_control.get("enabled", True)
         cache_reuse_control["enabled"] = False
         try:
             _subject_data_paths(int(sid), force_update=True)
         finally:
             cache_reuse_control["enabled"] = previous_reuse
-        if opts.redownload_once_per_subject and marker is not None:
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text("attempted\n", encoding="utf-8")
-
-    def _mark_failed_subject(sid: int, error_text: str) -> None:
-        marker = _failed_marker_path(int(sid))
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(error_text + "\n", encoding="utf-8")
-
-    def _clear_failed_subject_marker(sid: int) -> None:
-        marker = _failed_marker_path(int(sid))
-        if marker.exists():
-            marker.unlink()
 
     def _load_one_subject(sid: int) -> tuple[np.ndarray, np.ndarray, Any]:
         attempts = int(opts.subject_load_retries) + 1
         last_error: Exception | None = None
         for attempt in range(attempts):
             try:
-                return paradigm.get_data(dataset=dataset, subjects=[int(sid)])
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    loaded = paradigm.get_data(dataset=dataset, subjects=[int(sid)])
+
+                if caught:
+                    warning_messages = [str(w.message) for w in caught]
+                    first_message = warning_messages[0]
+
+                    if attempt < (attempts - 1) and opts.redownload_on_failure:
+                        loader_logger.warning(
+                            "Warning for %s subject=%d: %s; forcing redownload and retrying",
+                            dataset_name,
+                            int(sid),
+                            first_message,
+                        )
+                        _force_redownload_subject(int(sid))
+                        continue
+
+                    joined_messages = " | ".join(warning_messages)
+                    raise RuntimeError(
+                        "Subject load emitted warning(s) for "
+                        f"{dataset_name} subject={int(sid)}: {joined_messages}"
+                    )
+
+                return loaded
             except Exception as exc:  # pragma: no cover
                 last_error = exc
                 has_retry = attempt < (attempts - 1)
@@ -1032,10 +1031,8 @@ def load_moabb_motor_imagery_dataset(
         stack.enter_context(_mne_log_context(opts.mne_log_level))
         stack.enter_context(_moabb_log_context(opts.moabb_log_level))
         load_per_subject = (
-            opts.skip_failed_subjects
-            or int(opts.subject_load_retries) > 0
+            int(opts.subject_load_retries) > 0
             or bool(opts.redownload_on_failure)
-            or bool(opts.skip_known_failed_subjects)
             or (opts.show_progress and len(selected_subjects) > 1)
         )
         if load_per_subject:
@@ -1044,59 +1041,22 @@ def load_moabb_motor_imagery_dataset(
             x_parts: list[np.ndarray] = []
             y_parts: list[np.ndarray] = []
             meta_parts: list[Any] = []
-            failed_subjects: list[int] = []
 
             for sid in _progress_iter(
                 selected_subjects,
                 enabled=(opts.show_progress and len(selected_subjects) > 1),
                 desc=f"Loading {dataset_name}",
             ):
-                if (
-                    opts.skip_known_failed_subjects
-                    and _failed_marker_path(int(sid)).exists()
-                ):
-                    failed_subjects.append(int(sid))
-                    loader_logger.warning(
-                        "Skipping %s subject=%d due to previous failure marker",
-                        dataset_name,
-                        int(sid),
-                    )
-                    continue
-                try:
-                    x_sid, y_sid, meta_sid = _load_one_subject(int(sid))
-                except Exception as exc:  # pragma: no cover
-                    if not opts.skip_failed_subjects:
-                        raise
-                    failed_subjects.append(int(sid))
-                    _mark_failed_subject(int(sid), str(exc))
-                    loader_logger.warning(
-                        "Skipping %s subject=%d due to load error: %s",
-                        dataset_name,
-                        int(sid),
-                        str(exc),
-                    )
-                    continue
-                _clear_failed_subject_marker(int(sid))
+                x_sid, y_sid, meta_sid = _load_one_subject(int(sid))
                 x_parts.append(x_sid)
                 y_parts.append(np.asarray(y_sid))
                 meta_parts.append(meta_sid)
 
             if not x_parts:
-                if failed_subjects:
-                    raise ValueError(
-                        f"Dataset {dataset_name} failed for all selected subjects: {failed_subjects}"
-                    )
                 raise ValueError(f"Dataset {dataset_name} returned no trials")
             x = np.concatenate(x_parts, axis=0)
             y = np.concatenate(y_parts, axis=0)
             meta = pd.concat(meta_parts, axis=0, ignore_index=True)
-            if failed_subjects:
-                loader_logger.warning(
-                    "Loaded %s with %d skipped subjects: %s",
-                    dataset_name,
-                    len(failed_subjects),
-                    failed_subjects,
-                )
         else:
             x, y, meta = paradigm.get_data(dataset=dataset, subjects=selected_subjects)
 
@@ -1186,3 +1146,43 @@ def subsample_train_trials_per_subject_class(
     final_idx = np.concatenate(keep_indices)
     final_idx.sort()
     return x[final_idx], y[final_idx], subject_id[final_idx]
+
+
+
+
+# uv run training/pretrain_cross_dataset.py \
+#   --source_datasets physionetmi cho2017 lee2019_mi \
+#   --pretrain_mode ssl \
+#   --domain_mode subject \
+#   --epochs 50 \
+#   --batch_size 32 \
+#   --lr 1e-3 \
+#   --weight_decay 1e-4 \
+#   --val_split 0.2 \
+#   --ssl_weight 1.0 \
+#   --ssl_temperature 0.2 \
+#   --ssl_proj_dim 128 \
+#   --ssl_hidden_dim 256 \
+#   --ssl_noise_std 0.02 \
+#   --ssl_time_mask_ratio 0.1 \
+#   --ssl_domain_loss_weight 0.2 \
+#   --da_lambda_gamma 10.0 \
+#   --loader_euclidean_align \
+#   --model_euclidean_alignment \
+#   --model_riemannian_reweight \
+#   --cnn_out_channels 32 \
+#   --cnn_dropout 0.5 \
+#   --embedding_dim 128 \
+#   --num_heads 4 \
+#   --num_layers 2 \
+#   --dropout 0.1 \
+#   --use_cnn_domain_head \
+#   --cnn_domain_weight 0.1 \
+#   --num_workers 4 \
+#   --seed 42 \
+#   --deterministic \
+#   --subject_load_retries 2 \
+#   --redownload_on_failure \
+#   --data_path "/data/istiaqfuad/mne_data" \
+#   --output_dir "results/pretrain_cross_dataset" \
+#   --tag "ssl_final"
