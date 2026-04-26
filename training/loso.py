@@ -149,6 +149,25 @@ def _load_init_checkpoint(
         logger.info("Unexpected key sample: %s", unexpected[:5])
 
 
+def _configure_head_only_finetune(model: nn.Module, logger: logging.Logger) -> None:
+    """Freeze backbone and domain heads; train only the task head."""
+    for param in model.parameters():
+        param.requires_grad = False
+
+    for param in model.task_head.parameters():
+        param.requires_grad = True
+
+    total_params = sum(param.numel() for param in model.parameters())
+    trainable_params = sum(
+        param.numel() for param in model.parameters() if param.requires_grad
+    )
+    logger.info(
+        "Head-only fine-tune enabled: trainable_params=%d / total_params=%d",
+        trainable_params,
+        total_params,
+    )
+
+
 def train_one_fold(
     model: nn.Module,
     train_loader: torch.utils.data.DataLoader,
@@ -159,7 +178,10 @@ def train_one_fold(
     logger: logging.Logger,
 ) -> tuple[dict[str, float], list[dict[str, float]]]:
     criterion = nn.CrossEntropyLoss()
-    optimizer = Adam(model.parameters(), lr=lr)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable parameters found for optimizer")
+    optimizer = Adam(trainable_params, lr=lr)
 
     model.to(device)
     best = {"accuracy": 0.0, "kappa": 0.0, "epoch": 0.0}
@@ -230,7 +252,10 @@ def train_one_fold_da(
 ) -> tuple[dict[str, float], list[dict[str, float]]]:
     task_criterion = nn.CrossEntropyLoss()
     domain_criterion = nn.CrossEntropyLoss()
-    optimizer = Adam(model.parameters(), lr=lr)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable parameters found for optimizer")
+    optimizer = Adam(trainable_params, lr=lr)
 
     model.to(device)
     best = {"accuracy": 0.0, "kappa": 0.0, "epoch": 0.0}
@@ -336,6 +361,13 @@ def run(args: argparse.Namespace) -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     logger = setup_logger(run_dir)
+
+    if args.head_only_finetune and args.use_da:
+        raise ValueError(
+            "--head_only_finetune cannot be combined with --use_da in LOSO. "
+            "Disable DA for head-only transfer or disable head-only to use DA."
+        )
+
     logger.info("Loading MOABB dataset: %s", args.dataset)
 
     x, y, subject_ids, subjects = load_moabb_motor_imagery_dataset(
@@ -379,6 +411,7 @@ def run(args: argparse.Namespace) -> None:
     config = {
         "dataset": args.dataset,
         "init_checkpoint": args.init_checkpoint,
+        "head_only_finetune": args.head_only_finetune,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
         "lr": args.lr,
@@ -471,6 +504,9 @@ def run(args: argparse.Namespace) -> None:
         if args.init_checkpoint:
             _load_init_checkpoint(model, args.init_checkpoint, device, logger)
 
+        if args.head_only_finetune:
+            _configure_head_only_finetune(model, logger)
+
         if args.use_da:
             best, history = train_one_fold_da(
                 model=model,
@@ -500,7 +536,9 @@ def run(args: argparse.Namespace) -> None:
         per_subject[key] = best
 
         if args.checkpoint_mode == "per_subject":
-            torch.save(model.state_dict(), ckpt_dir / f"loso_subject_{held_out}_last.pt")
+            torch.save(
+                model.state_dict(), ckpt_dir / f"loso_subject_{held_out}_last.pt"
+            )
         elif args.checkpoint_mode == "single_file":
             run_models[key] = _state_dict_cpu(model)
 
@@ -555,6 +593,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--data_path", type=str, default=None)
     parser.add_argument("--init_checkpoint", type=str, default=None)
+    parser.add_argument("--head_only_finetune", action="store_true", default=False)
     parser.add_argument("--output_dir", type=str, default="results/loso")
     parser.add_argument(
         "--checkpoint_mode",
@@ -582,20 +621,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="model_pre_align_only",
         action="store_false",
     )
-    parser.add_argument("--model_euclidean_alignment", action="store_true", default=True)
+    parser.add_argument(
+        "--model_euclidean_alignment", action="store_true", default=True
+    )
     parser.add_argument(
         "--no-model-euclidean-alignment",
         dest="model_euclidean_alignment",
         action="store_false",
     )
-    parser.add_argument("--model_riemannian_reweight", action="store_true", default=True)
+    parser.add_argument(
+        "--model_riemannian_reweight", action="store_true", default=True
+    )
     parser.add_argument(
         "--no-model-riemannian-reweight",
         dest="model_riemannian_reweight",
         action="store_false",
     )
     parser.add_argument("--temporal_kernels", nargs="+", type=int, default=None)
-    parser.add_argument("--multiscale_preserve_capacity", action="store_true", default=False)
+    parser.add_argument(
+        "--multiscale_preserve_capacity", action="store_true", default=False
+    )
     parser.add_argument("--use_attention_pool", action="store_true", default=False)
     parser.add_argument("--attention_mix_init", type=float, default=0.5)
     parser.add_argument("--learnable_attention_mix", action="store_true", default=False)

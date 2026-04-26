@@ -741,7 +741,12 @@ def _is_cached_download_valid(path: Path) -> bool:
     if suffix == ".mat":
         return _is_valid_mat_header(path)
     if suffix == ".zip":
-        return zipfile.is_zipfile(path)
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                bad_crc = zf.testzip()
+                return bad_crc is None
+        except Exception:
+            return False
     if suffix == ".edf":
         try:
             with path.open("rb") as f:
@@ -934,21 +939,6 @@ def load_moabb_motor_imagery_dataset(
     dataset_key = str(getattr(dataset, "code", dataset_name)).lower()
     cache_reuse_control: dict[str, bool] = {"enabled": True}
 
-    def _is_redownloadable_error(exc: Exception) -> bool:
-        if isinstance(exc, OSError):
-            return True
-        text = str(exc).lower()
-        return (
-            "input/output error" in text
-            or "i/o error" in text
-            or "file_hash" in text
-            or "errno 5" in text
-            or "unknown mat file type" in text
-            or "expecting matrix here" in text
-            or "mat file appears to be truncated" in text
-            or "not a mat file" in text
-        )
-
     def _subject_data_paths(sid: int, force_update: bool = False) -> list[Path]:
         if not hasattr(dataset, "data_path"):
             return []
@@ -1004,27 +994,19 @@ def load_moabb_motor_imagery_dataset(
                     )
 
                 return loaded
-            except Exception as exc:  # pragma: no cover
-                last_error = exc
-                has_retry = attempt < (attempts - 1)
-                if has_retry and _is_redownloadable_error(exc) and opts.redownload_on_failure:
-                    try:
-                        _force_redownload_subject(int(sid))
-                        loader_logger.warning(
-                            "Retrying %s subject=%d after force redownload",
-                            dataset_name,
-                            int(sid),
-                        )
-                    except Exception as red_exc:
-                        loader_logger.warning(
-                            "Redownload failed for %s subject=%d: %s",
-                            dataset_name,
-                            int(sid),
-                            str(red_exc),
-                        )
-        if last_error is None:
-            raise RuntimeError(f"Unknown subject load error for {sid}")
-        raise last_error
+            except Exception as exc:
+                if attempt < (attempts - 1) and opts.redownload_on_failure:
+                    loader_logger.warning(
+                        "Error loading %s subject=%d: %s; forcing redownload and retrying",
+                        dataset_name,
+                        int(sid),
+                        str(exc)[:200],
+                    )
+                    _force_redownload_subject(int(sid))
+                    continue
+                raise RuntimeError(
+                    f"Failed loading {dataset_name} subject={int(sid)}: {exc}"
+                ) from exc
 
     with ExitStack() as stack:
         cache_reuse_control = stack.enter_context(_cache_first_pooch_retrieve_context())
@@ -1186,3 +1168,31 @@ def subsample_train_trials_per_subject_class(
 #   --data_path "/data/istiaqfuad/mne_data" \
 #   --output_dir "results/pretrain_cross_dataset" \
 #   --tag "ssl_final"
+
+
+
+# uv run training/pretrain_cross_dataset.py \
+#   --source_datasets physionetmi cho2017 lee2019_mi \
+#   --pretrain_mode ssl \
+#   --domain_mode subject \
+#   --validation_strategy subject_fold \
+#   --subject_val_folds 5 \
+#   --subject_val_fold_index 0 \
+#   --reject_artifact_trials \
+#   --artifact_z_threshold 3.5 \
+#   --subject_balanced_sampling \
+#   --loader_euclidean_align \
+#   --model_euclidean_alignment \
+#   --model_riemannian_reweight \
+#   --epochs 80 \
+#   --batch_size 32 \
+#   --lr 1e-3 \
+#   --weight_decay 1e-4 \
+#   --ssl_domain_loss_weight 0.15 \
+#   --da_lambda_gamma 6 \
+#   --seed 42 \
+#   --deterministic \
+#   --num_workers 4 \
+#   --data_path /data/istiaqfuad/mne_data \
+#   --tag ssl_subjectfold5_fold0_artifactrej_e80 \
+#   --output_dir results/pretrain_cross_dataset

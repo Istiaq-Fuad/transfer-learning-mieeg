@@ -14,17 +14,19 @@ from sklearn.metrics import cohen_kappa_score
 from torch import nn
 from torch.nn import functional as F
 from torch.optim import Adam
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 try:
     from data.loader import (
         DataLoaderOptions,
+        EEGDataset,
         MoabbLoadOptions,
         create_dataloaders,
         load_moabb_motor_imagery_dataset,
     )
     from models.heads import SSLProjectionHead
     from models.model import EEGModel
-    from training.utils import lambda_scheduler
+    from training.utils import apply_euclidean_alignment, fit_euclidean_alignment, lambda_scheduler
     from utils.reproducibility import (
         create_experiment_metadata,
         save_experiment_metadata,
@@ -39,13 +41,14 @@ except ModuleNotFoundError:
 
     from data.loader import (
         DataLoaderOptions,
+        EEGDataset,
         MoabbLoadOptions,
         create_dataloaders,
         load_moabb_motor_imagery_dataset,
     )
     from models.heads import SSLProjectionHead
     from models.model import EEGModel
-    from training.utils import lambda_scheduler
+    from training.utils import apply_euclidean_alignment, fit_euclidean_alignment, lambda_scheduler
     from utils.reproducibility import (
         create_experiment_metadata,
         save_experiment_metadata,
@@ -338,6 +341,138 @@ def load_source_mix(
     return x_all, y_all, domain_all, num_domains, stats, skipped
 
 
+def _filter_artifact_trials(
+    x: np.ndarray,
+    y: np.ndarray,
+    domain_id: np.ndarray,
+    z_threshold: float,
+    within_domain: bool,
+    logger: logging.Logger,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    if z_threshold <= 0.0:
+        raise ValueError("artifact_z_threshold must be > 0")
+
+    trial_ptp = np.ptp(x, axis=2).mean(axis=1)
+    keep_mask = np.ones(x.shape[0], dtype=bool)
+
+    if within_domain:
+        for did in np.unique(domain_id):
+            idx = np.where(domain_id == did)[0]
+            if idx.size < 8:
+                continue
+            ptp_d = trial_ptp[idx]
+            med = float(np.median(ptp_d))
+            mad = float(np.median(np.abs(ptp_d - med)))
+            scale = 1.4826 * mad + 1e-12
+            z = np.abs((ptp_d - med) / scale)
+            keep_mask[idx] = z <= z_threshold
+    else:
+        med = float(np.median(trial_ptp))
+        mad = float(np.median(np.abs(trial_ptp - med)))
+        scale = 1.4826 * mad + 1e-12
+        z = np.abs((trial_ptp - med) / scale)
+        keep_mask = z <= z_threshold
+
+    kept = int(keep_mask.sum())
+    removed = int((~keep_mask).sum())
+    removed_ratio = removed / max(keep_mask.size, 1)
+    logger.info(
+        "Artifact rejection: kept=%d removed=%d (%.2f%%) | mode=%s | z_threshold=%.2f",
+        kept,
+        removed,
+        100.0 * removed_ratio,
+        "within_domain" if within_domain else "global",
+        z_threshold,
+    )
+    return x[keep_mask], y[keep_mask], domain_id[keep_mask], float(removed_ratio)
+
+
+def _make_subject_fold_masks(
+    domain_id: np.ndarray,
+    num_folds: int,
+    fold_index: int,
+) -> tuple[np.ndarray, np.ndarray, list[int]]:
+    if num_folds < 2:
+        raise ValueError("subject_val_folds must be >= 2 for subject_fold validation")
+
+    unique_domains = np.array(sorted(np.unique(domain_id).tolist()), dtype=np.int64)
+    if unique_domains.size < num_folds:
+        raise ValueError(
+            f"Not enough domains ({unique_domains.size}) for subject_val_folds={num_folds}"
+        )
+    if fold_index < 0 or fold_index >= num_folds:
+        raise ValueError(
+            f"subject_val_fold_index must be in [0, {num_folds - 1}]"
+        )
+
+    fold_domains = np.array_split(unique_domains, num_folds)
+    val_domains = fold_domains[fold_index].astype(np.int64)
+    val_mask = np.isin(domain_id, val_domains)
+    train_mask = ~val_mask
+    return train_mask, val_mask, val_domains.tolist()
+
+
+def _make_fixed_split_dataloaders(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    d_train: np.ndarray,
+    x_val: np.ndarray,
+    y_val: np.ndarray,
+    d_val: np.ndarray,
+    options: DataLoaderOptions,
+) -> tuple[DataLoader, DataLoader]:
+    train_dataset = EEGDataset(x_train, y_train, d_train)
+    val_dataset = EEGDataset(x_val, y_val, d_val)
+
+    if options.apply_euclidean_align:
+        whitening = fit_euclidean_alignment(train_dataset.x, eps=options.align_eps)
+        train_dataset.x = apply_euclidean_alignment(train_dataset.x, whitening)
+        val_dataset.x = apply_euclidean_alignment(val_dataset.x, whitening)
+
+    train_generator = None
+    if options.seed is not None and options.deterministic:
+        train_generator = torch.Generator()
+        train_generator.manual_seed(int(options.seed))
+
+    train_sampler = None
+    train_shuffle = True
+    if options.subject_balanced_sampling:
+        sid = train_dataset.subject_id
+        unique_sid, counts = sid.unique(return_counts=True)
+        if unique_sid.numel() > 1:
+            count_map = {
+                int(subject.item()): float(count.item())
+                for subject, count in zip(unique_sid, counts)
+            }
+            weights = torch.tensor(
+                [1.0 / count_map[int(s.item())] for s in sid], dtype=torch.double
+            )
+            train_sampler = WeightedRandomSampler(
+                weights=weights,
+                num_samples=len(train_dataset),
+                replacement=True,
+                generator=train_generator,
+            )
+            train_shuffle = False
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=options.batch_size,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
+        drop_last=options.drop_last_train,
+        num_workers=options.num_workers,
+        generator=train_generator,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=options.batch_size,
+        shuffle=False,
+        num_workers=options.num_workers,
+    )
+    return train_loader, val_loader
+
+
 def run(args: argparse.Namespace) -> None:
     set_seed_everywhere(args.seed, deterministic=args.deterministic)
 
@@ -380,21 +515,61 @@ def run(args: argparse.Namespace) -> None:
     if skipped_datasets:
         logger.info("Skipped datasets after label filtering: %s", skipped_datasets)
 
-    train_loader, val_loader = create_dataloaders(
-        x=x,
-        y=y,
-        subject_id=domain_id,
-        loso_subject=None,
-        options=DataLoaderOptions(
-            batch_size=args.batch_size,
-            test_size=args.val_split,
-            random_state=args.seed,
-            apply_euclidean_align=args.loader_euclidean_align,
-            num_workers=args.num_workers,
-            seed=args.seed,
-            deterministic=args.deterministic,
-        ),
+    artifact_removed_ratio = 0.0
+    if args.reject_artifact_trials:
+        x, y, domain_id, artifact_removed_ratio = _filter_artifact_trials(
+            x=x,
+            y=y,
+            domain_id=domain_id,
+            z_threshold=args.artifact_z_threshold,
+            within_domain=args.artifact_within_domain,
+            logger=logger,
+        )
+        num_domains = int(np.unique(domain_id).shape[0])
+
+    loader_options = DataLoaderOptions(
+        batch_size=args.batch_size,
+        test_size=args.val_split,
+        random_state=args.seed,
+        apply_euclidean_align=args.loader_euclidean_align,
+        subject_balanced_sampling=args.subject_balanced_sampling,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        deterministic=args.deterministic,
     )
+
+    val_domains: list[int] = []
+    if args.validation_strategy == "subject_fold":
+        train_mask, val_mask, val_domains = _make_subject_fold_masks(
+            domain_id=domain_id,
+            num_folds=args.subject_val_folds,
+            fold_index=args.subject_val_fold_index,
+        )
+        train_loader, val_loader = _make_fixed_split_dataloaders(
+            x_train=x[train_mask],
+            y_train=y[train_mask],
+            d_train=domain_id[train_mask],
+            x_val=x[val_mask],
+            y_val=y[val_mask],
+            d_val=domain_id[val_mask],
+            options=loader_options,
+        )
+        logger.info(
+            "Validation strategy=subject_fold | fold=%d/%d | train_trials=%d | val_trials=%d | heldout_domains=%d",
+            args.subject_val_fold_index + 1,
+            args.subject_val_folds,
+            int(train_mask.sum()),
+            int(val_mask.sum()),
+            len(val_domains),
+        )
+    else:
+        train_loader, val_loader = create_dataloaders(
+            x=x,
+            y=y,
+            subject_id=domain_id,
+            loso_subject=None,
+            options=loader_options,
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = EEGModel(
@@ -448,11 +623,19 @@ def run(args: argparse.Namespace) -> None:
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "val_split": args.val_split,
+        "validation_strategy": args.validation_strategy,
+        "subject_val_folds": args.subject_val_folds,
+        "subject_val_fold_index": args.subject_val_fold_index,
         "domain_loss_weight": args.domain_loss_weight,
         "ssl_domain_loss_weight": args.ssl_domain_loss_weight,
         "effective_domain_loss_weight": effective_domain_loss_weight,
         "da_lambda_gamma": args.da_lambda_gamma,
         "loader_euclidean_align": args.loader_euclidean_align,
+        "subject_balanced_sampling": args.subject_balanced_sampling,
+        "reject_artifact_trials": args.reject_artifact_trials,
+        "artifact_z_threshold": args.artifact_z_threshold,
+        "artifact_within_domain": args.artifact_within_domain,
+        "artifact_removed_ratio": artifact_removed_ratio,
         "model_pre_align_only": args.model_pre_align_only,
         "model_euclidean_alignment": args.model_euclidean_alignment,
         "model_riemannian_reweight": args.model_riemannian_reweight,
@@ -688,6 +871,7 @@ def run(args: argparse.Namespace) -> None:
         "class_policy": class_policy,
         "domain_mode": args.domain_mode,
         "num_domains": num_domains,
+        "heldout_val_domains": val_domains,
         "n_train": int(len(train_loader.dataset)),
         "n_val": int(len(val_loader.dataset)),
         "source_stats": source_stats,
@@ -754,6 +938,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--val_split", type=float, default=0.2)
+    parser.add_argument(
+        "--validation_strategy",
+        type=str,
+        default="random",
+        choices=["random", "subject_fold"],
+    )
+    parser.add_argument("--subject_val_folds", type=int, default=5)
+    parser.add_argument("--subject_val_fold_index", type=int, default=0)
     parser.add_argument("--domain_loss_weight", type=float, default=1.0)
     parser.add_argument(
         "--ssl_domain_loss_weight",
@@ -789,6 +981,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-model-riemannian-reweight",
         dest="model_riemannian_reweight",
+        action="store_false",
+    )
+    parser.add_argument("--subject_balanced_sampling", action="store_true", default=False)
+    parser.add_argument("--reject_artifact_trials", action="store_true", default=False)
+    parser.add_argument("--artifact_z_threshold", type=float, default=3.5)
+    parser.add_argument("--artifact_within_domain", action="store_true", default=True)
+    parser.add_argument(
+        "--no-artifact-within-domain",
+        dest="artifact_within_domain",
         action="store_false",
     )
 

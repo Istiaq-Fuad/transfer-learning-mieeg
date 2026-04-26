@@ -1,0 +1,57 @@
+{
+  "protocol": "pretrain_cross_dataset",
+  "source_datasets": [
+    "physionetmi",
+    "cho2017",
+    "lee2019_mi"
+  ],
+  "skipped_datasets": [],
+  "pretrain_mode": "ssl",
+  "class_policy": "all_mi",
+  "domain_mode": "subject",
+  "num_domains": 215,
+  "n_train": 32226,
+  "n_val": 8057,
+  "source_stats": [
+    {
+      "dataset": "physionetmi",
+      "n_trials": 18963,
+      "n_channels": 16,
+      "n_times": 513,
+      "n_subjects": 109,
+      "n_classes": 5,
+      "n_domain_labels": 109
+    },
+    {
+      "dataset": "cho2017",
+      "n_trials": 10520,
+      "n_channels": 16,
+      "n_times": 512,
+      "n_subjects": 52,
+      "n_classes": 2,
+      "n_domain_labels": 52
+    },
+    {
+      "dataset": "lee2019_mi",
+      "n_trials": 10800,
+      "n_channels": 16,
+      "n_times": 512,
+      "n_subjects": 54,
+      "n_classes": 2,
+      "n_domain_labels": 54
+    }
+  ],
+  "best": {
+    "accuracy": -1.0,
+    "kappa": -1.0,
+    "task_loss": -1.0,
+    "ssl_loss": 0.639152383100044,
+    "epoch": 49.0
+  },
+  "checkpoints": {
+    "last": "results/pretrain_cross_dataset/pretrain_ssl_final_20260426_010947/checkpoints/pretrain_last.pt",
+    "best": "results/pretrain_cross_dataset/pretrain_ssl_final_20260426_010947/checkpoints/pretrain_best.pt",
+    "ssl_proj_last": "results/pretrain_cross_dataset/pretrain_ssl_final_20260426_010947/checkpoints/ssl_proj_last.pt",
+    "ssl_proj_best": "results/pretrain_cross_dataset/pretrain_ssl_final_20260426_010947/checkpoints/ssl_proj_best.pt"
+  }
+}
