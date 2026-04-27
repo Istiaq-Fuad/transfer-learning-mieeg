@@ -1,0 +1,67 @@
+{
+  "sessions": {
+    "019dcb5d-e8e3-7592-9f01-79df85ea90e1": {
+      "user_message_count": 4,
+      "agent_message_count": 134,
+      "start_timestamp": "2026-04-26T19:57:10.933Z",
+      "end_timestamp": "2026-04-26T20:12:54.789Z",
+      "markdown_size_bytes": 361651,
+      "provider": "codex-cli",
+      "last_updated": "2026-04-27T05:37:40Z"
+    },
+    "0d3769ef-9c48-4f01-a816-cf32e10fde16": {
+      "user_message_count": 1,
+      "agent_message_count": 0,
+      "start_timestamp": "2026-04-13T04:26:54+06:00",
+      "end_timestamp": "1970-01-01T06:00:00+06:00",
+      "markdown_size_bytes": 1389,
+      "provider": "copilotide",
+      "last_updated": "2026-04-26T17:56:31Z"
+    },
+    "0de483bb-065c-4998-bcff-79d21109a208": {
+      "user_message_count": 22,
+      "agent_message_count": 14,
+      "start_timestamp": "2026-04-26T12:20:24+06:00",
+      "end_timestamp": "1970-01-01T06:00:00+06:00",
+      "markdown_size_bytes": 13085,
+      "provider": "copilotide",
+      "last_updated": "2026-04-27T05:37:39Z"
+    },
+    "3ad7c545-6436-4226-8d03-0f5e7103b556": {
+      "user_message_count": 1,
+      "agent_message_count": 1,
+      "start_timestamp": "2026-04-15T20:14:04+06:00",
+      "end_timestamp": "1970-01-01T06:00:00+06:00",
+      "markdown_size_bytes": 371,
+      "provider": "copilotide",
+      "last_updated": "2026-04-27T05:37:39Z"
+    },
+    "46c81b94-a978-4ca9-921c-60d8e3f4818c": {
+      "user_message_count": 5,
+      "agent_message_count": 4,
+      "start_timestamp": "2026-04-12T17:03:32+06:00",
+      "end_timestamp": "1970-01-01T06:00:00+06:00",
+      "markdown_size_bytes": 9191,
+      "provider": "copilotide",
+      "last_updated": "2026-04-27T05:37:39Z"
+    },
+    "8711b4a6-e514-4d39-be3e-cff6c7b6243a": {
+      "user_message_count": 3,
+      "agent_message_count": 0,
+      "start_timestamp": "2026-04-26T23:35:03+06:00",
+      "end_timestamp": "1970-01-01T06:00:00+06:00",
+      "markdown_size_bytes": 726,
+      "provider": "copilotide",
+      "last_updated": "2026-04-26T17:56:31Z"
+    },
+    "d82cf17d-3fb1-49ae-9539-aa820ddfe428": {
+      "user_message_count": 3,
+      "agent_message_count": 2,
+      "start_timestamp": "2026-04-13T00:49:29+06:00",
+      "end_timestamp": "1970-01-01T06:00:00+06:00",
+      "markdown_size_bytes": 890,
+      "provider": "copilotide",
+      "last_updated": "2026-04-26T17:56:31Z"
+    }
+  }
+}

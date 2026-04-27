@@ -914,7 +914,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=["physionetmi", "cho2017", "lee2019_mi"],
         choices=["physionetmi", "cho2017", "lee2019_mi", "bnci2014_001"],
     )
-    parser.add_argument("--domain_mode", type=str, default="dataset", choices=["dataset", "subject"])
+    parser.add_argument("--domain_mode", type=str, default="subject", choices=["dataset", "subject"])
     parser.add_argument("--data_path", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="results/pretrain_cross_dataset")
     parser.add_argument("--tag", type=str, default="")
@@ -929,19 +929,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pretrain_mode",
         type=str,
-        default="ssl",
+        default="supervised",
         choices=["supervised", "ssl"],
     )
 
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--val_split", type=float, default=0.2)
     parser.add_argument(
         "--validation_strategy",
         type=str,
-        default="random",
+        default="subject_fold",
         choices=["random", "subject_fold"],
     )
     parser.add_argument("--subject_val_folds", type=int, default=5)

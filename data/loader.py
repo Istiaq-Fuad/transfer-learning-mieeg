@@ -368,14 +368,16 @@ def create_loso_domain_adaptation_dataloaders(
     Build LOSO loaders for adversarial DA.
 
     Source loader: all non-target-subject trials with labels.
-    Target train loader: target-subject trials (labels ignored during training).
-    Test loader: target-subject trials for evaluation.
+    Target train loader: target-subject adaptation split (labels ignored during training).
+    Test loader: held-out target-subject test split for evaluation.
     """
     opts = _resolve_data_loader_options(
         options,
         legacy_options,
         {
             "batch_size",
+            "target_test_size",
+            "random_state",
             "apply_euclidean_align",
             "align_eps",
             "drop_last_train",
@@ -395,20 +397,33 @@ def create_loso_domain_adaptation_dataloaders(
     if int(target_mask.sum()) == 0:
         raise ValueError(f"Target subject {target_subject} not found")
 
+    target_indices = np.where(target_mask)[0]
+    target_y = y[target_indices]
+    if np.unique(target_y).shape[0] < 2:
+        raise ValueError(
+            f"Target subject {target_subject} has fewer than 2 classes after filtering"
+        )
+    target_adapt_idx, target_test_idx = train_test_split(
+        target_indices,
+        test_size=opts.target_test_size,
+        random_state=opts.random_state,
+        stratify=target_y,
+    )
+
     source_dataset = EEGDataset(
         x[source_mask],
         y[source_mask],
         np.zeros(int(source_mask.sum()), dtype=np.int64),
     )
     target_train_dataset = EEGDataset(
-        x[target_mask],
-        y[target_mask],
-        np.ones(int(target_mask.sum()), dtype=np.int64),
+        x[target_adapt_idx],
+        y[target_adapt_idx],
+        np.ones(target_adapt_idx.shape[0], dtype=np.int64),
     )
     target_test_dataset = EEGDataset(
-        x[target_mask],
-        y[target_mask],
-        np.ones(int(target_mask.sum()), dtype=np.int64),
+        x[target_test_idx],
+        y[target_test_idx],
+        np.ones(target_test_idx.shape[0], dtype=np.int64),
     )
 
     if opts.apply_euclidean_align:

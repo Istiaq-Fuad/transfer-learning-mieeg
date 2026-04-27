@@ -1,0 +1,100 @@
+{
+  "protocol": "pretrain_cross_dataset",
+  "source_datasets": [
+    "physionetmi",
+    "cho2017",
+    "lee2019_mi"
+  ],
+  "skipped_datasets": [],
+  "pretrain_mode": "supervised",
+  "class_policy": "left_right",
+  "domain_mode": "subject",
+  "num_domains": 215,
+  "heldout_val_domains": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42
+  ],
+  "n_train": 24288,
+  "n_val": 1930,
+  "source_stats": [
+    {
+      "dataset": "physionetmi",
+      "n_trials": 4898,
+      "n_channels": 16,
+      "n_times": 513,
+      "n_subjects": 109,
+      "n_classes": 2,
+      "n_domain_labels": 109
+    },
+    {
+      "dataset": "cho2017",
+      "n_trials": 10520,
+      "n_channels": 16,
+      "n_times": 512,
+      "n_subjects": 52,
+      "n_classes": 2,
+      "n_domain_labels": 52
+    },
+    {
+      "dataset": "lee2019_mi",
+      "n_trials": 10800,
+      "n_channels": 16,
+      "n_times": 512,
+      "n_subjects": 54,
+      "n_classes": 2,
+      "n_domain_labels": 54
+    }
+  ],
+  "best": {
+    "accuracy": 0.6538860103626943,
+    "kappa": 0.3072877600276819,
+    "task_loss": 0.6226542346835754,
+    "ssl_loss": -1.0,
+    "epoch": 78.0
+  },
+  "checkpoints": {
+    "last": "results/pretrain_cross_dataset/pretrain_physionetmi_cho2017_lee2019_mi_20260427_021535/checkpoints/pretrain_last.pt",
+    "best": "results/pretrain_cross_dataset/pretrain_physionetmi_cho2017_lee2019_mi_20260427_021535/checkpoints/pretrain_best.pt"
+  }
+}

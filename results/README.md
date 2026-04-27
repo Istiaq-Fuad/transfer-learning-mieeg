@@ -119,3 +119,63 @@ Use this plan after enabling new architecture switches like `--temporal_kernels`
      1) highest mean LOSO accuracy,
      2) lower std accuracy,
      3) higher mean kappa.
+
+## Supervised Pretraining Transfer Protocol
+
+Use this protocol before making reduced-data claims. The LOSO trainer now selects
+epochs on a source-subject validation split and reports the old best-test number
+separately as `legacy_best_test_*`.
+
+Pretrain:
+
+```bash
+uv run python training/pretrain_cross_dataset.py \
+  --source_datasets physionetmi cho2017 lee2019_mi \
+  --pretrain_mode supervised \
+  --domain_mode subject \
+  --validation_strategy subject_fold \
+  --subject_val_folds 5 \
+  --subject_val_fold_index 0 \
+  --loader_euclidean_align \
+  --model_pre_align_only \
+  --subject_balanced_sampling \
+  --epochs 80 \
+  --lr 1e-3 \
+  --weight_decay 1e-4 \
+  --seed 42 \
+  --deterministic
+```
+
+Full-data LOSO transfer:
+
+```bash
+uv run python training/loso.py \
+  --dataset bnci2014_001 \
+  --init_checkpoint results/pretrain_cross_dataset/<run>/checkpoints/pretrain_best.pt \
+  --epochs 50 \
+  --lr 1e-3 \
+  --source_val_size 0.2 \
+  --selection_metric accuracy \
+  --loader_euclidean_align \
+  --model_pre_align_only \
+  --seed 42 \
+  --deterministic
+```
+
+Reduced-data comparison after full-data recovery:
+
+```bash
+for fraction in 0.5 0.25 0.1; do
+  uv run python training/loso.py \
+    --dataset bnci2014_001 \
+    --init_checkpoint results/pretrain_cross_dataset/<run>/checkpoints/pretrain_best.pt \
+    --train_fraction "$fraction" \
+    --epochs 50 \
+    --lr 1e-3 \
+    --source_val_size 0.2 \
+    --loader_euclidean_align \
+    --model_pre_align_only \
+    --seed 42 \
+    --deterministic
+done
+```
