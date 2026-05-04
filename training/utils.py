@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import torch
 
 
@@ -61,23 +59,16 @@ def euclidean_alignment(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 def riemannian_reweight(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """
-    Riemannian-inspired covariance reweighting.
+    Stable per-trial covariance reweighting using trace normalization.
+
+    Unlike the Frobenius-norm version, trace normalization is invariant to
+    overall signal amplitude, preventing high-power subjects (e.g. S6)
+    from dominating and giving low-power subjects (e.g. S5) a fair chance.
 
     Args:
         x: (B, C, T)
     """
     cov = torch.matmul(x, x.transpose(-1, -2))  # (B, C, C)
-    fro = torch.linalg.norm(cov, ord="fro", dim=(-2, -1), keepdim=True)
-    cov_norm = cov / (fro + eps)
+    trace = cov.diagonal(dim1=-2, dim2=-1).sum(dim=-1, keepdim=True).unsqueeze(-1)
+    cov_norm = cov / (trace + eps)
     return torch.matmul(cov_norm, x)
-
-
-def lambda_scheduler(
-    epoch: int,
-    max_epoch: int,
-    gamma: float = 10.0,
-) -> float:
-    """DANN-style lambda schedule."""
-    denom = max(max_epoch, 1)
-    p = float(epoch) / float(denom)
-    return 2.0 / (1.0 + math.exp(-gamma * p)) - 1.0

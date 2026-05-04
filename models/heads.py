@@ -24,11 +24,20 @@ class GRL(nn.Module):
 
 
 class TaskHead(nn.Module):
-    def __init__(self, embedding_dim: int, num_classes: int) -> None:
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_classes: int,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
+        self.norm = nn.LayerNorm(embedding_dim)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.classifier = nn.Linear(embedding_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(x)
+        x = self.dropout(x)
         return self.classifier(x)
 
 
@@ -74,18 +83,3 @@ class DomainHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.classifier(x)
-
-
-class SSLProjectionHead(nn.Module):
-    """Projection head for contrastive SSL objectives."""
-
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)

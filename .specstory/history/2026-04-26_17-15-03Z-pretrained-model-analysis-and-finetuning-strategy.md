@@ -15,3 +15,29 @@ It is stuck for a long time check if the work is completed
 _**User (2026-04-26 17:53:43Z)**_
 
 It is stuck for a long time check if the work is completed
+
+_**User (2026-04-26 17:56:34Z)**_
+
+It is stuck for a long time check if the work is completed
+
+---
+
+_**Agent (copilot/auto)**_
+
+**Checking work progress**
+
+I need to answer the user who's asking if their work is completed after being stuck for a while. It seems essential to check the current state, especially since previous assistant messages might not have included actual tool use. I should probably inspect any running terminals or active outputs to verify progress. I might need to use tools like `get_terminal_output` or check for file modifications. It’s important to provide an update on the current status.
+
+---
+
+_**User (2026-04-26 17:57:59Z)**_
+
+ok go on
+
+---
+
+_**Agent (copilot/auto)**_
+
+**Working on LOSO improvement**
+
+I need to continue refining the `loso.py` script and think about fine-tuning, possibly for the training script. The user wants to enhance finetuning

@@ -1,7 +1,0 @@
-{
-  "experiment_id": "pretrain_cross_dataset_physionetmi+cho2017+lee2019_mi_569c740aa7e3",
-  "config_hash": "569c740aa7e3",
-  "seed": 42,
-  "deterministic": true,
-  "notes": ""
-}

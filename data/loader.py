@@ -64,17 +64,17 @@ class SplitResult:
 
 @dataclass(frozen=True)
 class MoabbLoadOptions:
-    resample: int = 128
+    resample: int = 250
     tmin: float = 0.0
     tmax: float = 4.0
     fmin: float = 4.0
     fmax: float = 40.0
     subjects: list[int] | None = None
     max_subjects: int | None = None
-    include_metadata: bool = False
+    class_policy: str = "all"
+    use_common_channels: bool = False
     mne_log_level: str | None = "ERROR"
     moabb_log_level: str | None = "ERROR"
-    class_policy: str = "left_right"
     show_progress: bool = True
     subject_load_retries: int = 0
     redownload_on_failure: bool = True
@@ -84,7 +84,6 @@ class MoabbLoadOptions:
 class DataLoaderOptions:
     batch_size: int = 32
     test_size: float = 0.2
-    target_test_size: float = 0.2
     random_state: int = 42
     apply_euclidean_align: bool = True
     align_eps: float = 1e-6
@@ -356,349 +355,6 @@ def create_within_subject_dataloaders(
     return train_loader, test_loader
 
 
-def create_loso_domain_adaptation_dataloaders(
-    x: np.ndarray,
-    y: np.ndarray,
-    subject_id: np.ndarray,
-    target_subject: int,
-    options: DataLoaderOptions | None = None,
-    **legacy_options: Any,
-) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """
-    Build LOSO loaders for adversarial DA.
-
-    Source loader: all non-target-subject trials with labels.
-    Target train loader: target-subject adaptation split (labels ignored during training).
-    Test loader: held-out target-subject test split for evaluation.
-    """
-    opts = _resolve_data_loader_options(
-        options,
-        legacy_options,
-        {
-            "batch_size",
-            "target_test_size",
-            "random_state",
-            "apply_euclidean_align",
-            "align_eps",
-            "drop_last_train",
-            "num_workers",
-            "seed",
-            "deterministic",
-        },
-    )
-
-    source_mask = subject_id != target_subject
-    target_mask = subject_id == target_subject
-
-    if int(source_mask.sum()) == 0:
-        raise ValueError(
-            f"No source samples found when target_subject={target_subject}"
-        )
-    if int(target_mask.sum()) == 0:
-        raise ValueError(f"Target subject {target_subject} not found")
-
-    target_indices = np.where(target_mask)[0]
-    target_y = y[target_indices]
-    if np.unique(target_y).shape[0] < 2:
-        raise ValueError(
-            f"Target subject {target_subject} has fewer than 2 classes after filtering"
-        )
-    target_adapt_idx, target_test_idx = train_test_split(
-        target_indices,
-        test_size=opts.target_test_size,
-        random_state=opts.random_state,
-        stratify=target_y,
-    )
-
-    source_dataset = EEGDataset(
-        x[source_mask],
-        y[source_mask],
-        np.zeros(int(source_mask.sum()), dtype=np.int64),
-    )
-    target_train_dataset = EEGDataset(
-        x[target_adapt_idx],
-        y[target_adapt_idx],
-        np.ones(target_adapt_idx.shape[0], dtype=np.int64),
-    )
-    target_test_dataset = EEGDataset(
-        x[target_test_idx],
-        y[target_test_idx],
-        np.ones(target_test_idx.shape[0], dtype=np.int64),
-    )
-
-    if opts.apply_euclidean_align:
-        whitening = fit_euclidean_alignment(source_dataset.x, eps=opts.align_eps)
-        source_dataset.x = apply_euclidean_alignment(source_dataset.x, whitening)
-        target_train_dataset.x = apply_euclidean_alignment(
-            target_train_dataset.x, whitening
-        )
-        target_test_dataset.x = apply_euclidean_alignment(
-            target_test_dataset.x, whitening
-        )
-
-    generator = None
-    if opts.seed is not None and opts.deterministic:
-        generator = build_torch_generator(opts.seed)
-
-    source_loader = DataLoader(
-        source_dataset,
-        batch_size=opts.batch_size,
-        shuffle=True,
-        drop_last=opts.drop_last_train,
-        num_workers=opts.num_workers,
-        generator=generator,
-    )
-    target_train_loader = DataLoader(
-        target_train_dataset,
-        batch_size=opts.batch_size,
-        shuffle=True,
-        drop_last=opts.drop_last_train,
-        num_workers=opts.num_workers,
-        generator=generator,
-    )
-    target_test_loader = DataLoader(
-        target_test_dataset,
-        batch_size=opts.batch_size,
-        shuffle=False,
-        num_workers=opts.num_workers,
-    )
-    return source_loader, target_train_loader, target_test_loader
-
-
-def create_within_subject_domain_adaptation_dataloaders(
-    x: np.ndarray,
-    y: np.ndarray,
-    subject_id: np.ndarray,
-    session_id: np.ndarray,
-    target_subject: int,
-    target_session: int | None = None,
-    options: DataLoaderOptions | None = None,
-    **legacy_options: Any,
-) -> tuple[DataLoader, DataLoader, DataLoader, int]:
-    """
-    Build within-subject DA loaders by splitting domains with session IDs.
-
-    Source loader: selected subject, all sessions except target session.
-    Target train loader: target session (unlabeled in training).
-    Test loader: held-out subset from target session.
-    """
-    opts = _resolve_data_loader_options(
-        options,
-        legacy_options,
-        {
-            "batch_size",
-            "target_test_size",
-            "random_state",
-            "apply_euclidean_align",
-            "align_eps",
-            "drop_last_train",
-            "num_workers",
-            "seed",
-            "deterministic",
-        },
-    )
-
-    mask = subject_id == target_subject
-    if int(mask.sum()) == 0:
-        raise ValueError(f"Subject {target_subject} not found")
-
-    x_sub = x[mask]
-    y_sub = y[mask]
-    s_sub = session_id[mask]
-
-    sessions = np.unique(s_sub)
-    if sessions.shape[0] < 2:
-        raise ValueError(
-            f"Subject {target_subject} needs at least 2 sessions for DA, got {sessions.shape[0]}"
-        )
-
-    selected_target_session = int(sessions[-1])
-    if target_session is not None:
-        if int(target_session) not in {int(v) for v in sessions.tolist()}:
-            raise ValueError(
-                f"target_session={target_session} not found for subject {target_subject}"
-            )
-        selected_target_session = int(target_session)
-
-    source_mask = s_sub != selected_target_session
-    target_mask = s_sub == selected_target_session
-
-    if np.unique(y_sub[source_mask]).shape[0] < 2:
-        raise ValueError(
-            f"Source sessions for subject {target_subject} have fewer than 2 classes"
-        )
-    if np.unique(y_sub[target_mask]).shape[0] < 2:
-        raise ValueError(
-            f"Target session for subject {target_subject} has fewer than 2 classes"
-        )
-
-    target_indices = np.where(target_mask)[0]
-    target_train_idx, target_test_idx = train_test_split(
-        target_indices,
-        test_size=opts.target_test_size,
-        random_state=opts.random_state,
-        stratify=y_sub[target_mask],
-    )
-
-    source_dataset = EEGDataset(
-        x_sub[source_mask],
-        y_sub[source_mask],
-        np.zeros(int(source_mask.sum()), dtype=np.int64),
-    )
-    target_train_dataset = EEGDataset(
-        x_sub[target_train_idx],
-        y_sub[target_train_idx],
-        np.ones(target_train_idx.shape[0], dtype=np.int64),
-    )
-    target_test_dataset = EEGDataset(
-        x_sub[target_test_idx],
-        y_sub[target_test_idx],
-        np.ones(target_test_idx.shape[0], dtype=np.int64),
-    )
-
-    if opts.apply_euclidean_align:
-        whitening = fit_euclidean_alignment(source_dataset.x, eps=opts.align_eps)
-        source_dataset.x = apply_euclidean_alignment(source_dataset.x, whitening)
-        target_train_dataset.x = apply_euclidean_alignment(
-            target_train_dataset.x, whitening
-        )
-        target_test_dataset.x = apply_euclidean_alignment(
-            target_test_dataset.x, whitening
-        )
-
-    generator = None
-    if opts.seed is not None and opts.deterministic:
-        generator = build_torch_generator(opts.seed)
-
-    source_loader = DataLoader(
-        source_dataset,
-        batch_size=opts.batch_size,
-        shuffle=True,
-        drop_last=opts.drop_last_train,
-        num_workers=opts.num_workers,
-        generator=generator,
-    )
-    target_train_loader = DataLoader(
-        target_train_dataset,
-        batch_size=opts.batch_size,
-        shuffle=True,
-        drop_last=opts.drop_last_train,
-        num_workers=opts.num_workers,
-        generator=generator,
-    )
-    target_test_loader = DataLoader(
-        target_test_dataset,
-        batch_size=opts.batch_size,
-        shuffle=False,
-        num_workers=opts.num_workers,
-    )
-    return (
-        source_loader,
-        target_train_loader,
-        target_test_loader,
-        selected_target_session,
-    )
-
-
-def _encode_meta_column(values: np.ndarray) -> tuple[np.ndarray, dict[str, int]]:
-    labels = [str(v) for v in values.tolist()]
-    uniq = sorted(set(labels))
-    mapping = {label: idx for idx, label in enumerate(uniq)}
-    encoded = np.asarray([mapping[label] for label in labels], dtype=np.int64)
-    return encoded, mapping
-
-
-def _mne_log_context(level: str | None):
-    if level is None:
-        return nullcontext()
-    try:
-        import mne
-
-    except ModuleNotFoundError:
-        return nullcontext()
-    return mne.use_log_level(level, add_frames=False)
-
-
-def _progress_iter(values: list[int], enabled: bool, desc: str):
-    if not enabled:
-        return values
-    try:
-        from tqdm.auto import tqdm
-    except ModuleNotFoundError:
-        return values
-    return tqdm(values, desc=desc, unit="subject")
-
-
-def _parse_log_level(level: str) -> int:
-    value = getattr(logging, level.upper(), None)
-    if not isinstance(value, int):
-        raise ValueError(f"Unsupported log level: {level}")
-    return value
-
-
-@contextmanager
-def _moabb_log_context(level: str | None):
-    if level is None:
-        yield
-        return
-
-    parsed = _parse_log_level(level)
-    logger_names = ("moabb", "moabb.datasets", "moabb.datasets.gigadb")
-    loggers = [logging.getLogger(name) for name in logger_names]
-    previous_levels = [logger.level for logger in loggers]
-
-    for logger in loggers:
-        logger.setLevel(parsed)
-
-    try:
-        yield
-    finally:
-        for logger, previous in zip(loggers, previous_levels):
-            logger.setLevel(previous)
-
-
-def _canonical_motor_imagery_label(label: Any) -> str:
-    text = str(label).strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "left": "left_hand",
-        "left_hand": "left_hand",
-        "right": "right_hand",
-        "right_hand": "right_hand",
-    }
-    return aliases.get(text, text)
-
-
-def _select_left_right_trials(
-    x: np.ndarray,
-    y: np.ndarray,
-    meta: Any,
-    dataset_name: str,
-) -> tuple[np.ndarray, np.ndarray, Any]:
-    canonical = np.asarray([_canonical_motor_imagery_label(v) for v in y], dtype=object)
-    keep = np.isin(canonical, ["left_hand", "right_hand"])
-    if int(keep.sum()) == 0:
-        labels = sorted(set(canonical.tolist()))
-        raise ValueError(
-            f"Dataset {dataset_name} has no left/right-hand trials in this configuration. Available labels: {labels}"
-        )
-
-    x_lr = x[keep]
-    y_lr = canonical[keep]
-    meta_lr = meta.iloc[np.where(keep)[0]].reset_index(drop=True)
-
-    present = sorted(set(y_lr.tolist()))
-    if present != ["left_hand", "right_hand"]:
-        raise ValueError(
-            f"Dataset {dataset_name} does not contain both left and right classes after filtering: {present}"
-        )
-
-    return x_lr, y_lr, meta_lr
-
-
-def _canonicalize_labels(y: np.ndarray) -> np.ndarray:
-    return np.asarray([_canonical_motor_imagery_label(v) for v in y], dtype=object)
-
-
 def _flatten_paths(value: Any) -> list[Path]:
     if isinstance(value, (str, Path)):
         return [Path(value)]
@@ -855,6 +511,97 @@ def _cache_first_pooch_retrieve_context():
         pooch.retrieve = original_retrieve
 
 
+def _mne_log_context(level: str | None):
+    if level is None:
+        return nullcontext()
+    try:
+        import mne
+
+    except ModuleNotFoundError:
+        return nullcontext()
+    return mne.use_log_level(level, add_frames=False)
+
+
+def _progress_iter(values: list[int], enabled: bool, desc: str):
+    if not enabled:
+        return values
+    try:
+        from tqdm.auto import tqdm
+    except ModuleNotFoundError:
+        return values
+    return tqdm(values, desc=desc, unit="subject")
+
+
+def _parse_log_level(level: str) -> int:
+    value = getattr(logging, level.upper(), None)
+    if not isinstance(value, int):
+        raise ValueError(f"Unsupported log level: {level}")
+    return value
+
+
+@contextmanager
+def _moabb_log_context(level: str | None):
+    if level is None:
+        yield
+        return
+
+    parsed = _parse_log_level(level)
+    logger_names = ("moabb", "moabb.datasets", "moabb.datasets.gigadb")
+    loggers = [logging.getLogger(name) for name in logger_names]
+    previous_levels = [logger.level for logger in loggers]
+
+    for logger in loggers:
+        logger.setLevel(parsed)
+
+    try:
+        yield
+    finally:
+        for logger, previous in zip(loggers, previous_levels):
+            logger.setLevel(previous)
+
+
+def _canonical_motor_imagery_label(label: Any) -> str:
+    text = str(label).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "left": "left_hand",
+        "left_hand": "left_hand",
+        "right": "right_hand",
+        "right_hand": "right_hand",
+        "feet": "feet",
+        "both_feet": "feet",
+        "foot": "feet",
+        "tongue": "tongue",
+    }
+    return aliases.get(text, text)
+
+
+def _select_left_right_trials(
+    x: np.ndarray,
+    y: np.ndarray,
+    meta: Any,
+    dataset_name: str,
+) -> tuple[np.ndarray, np.ndarray, Any]:
+    canonical = np.asarray([_canonical_motor_imagery_label(v) for v in y], dtype=object)
+    keep = np.isin(canonical, ["left_hand", "right_hand"])
+    if int(keep.sum()) == 0:
+        labels = sorted(set(canonical.tolist()))
+        raise ValueError(
+            f"Dataset {dataset_name} has no left/right-hand trials. Available labels: {labels}"
+        )
+
+    x_lr = x[keep]
+    y_lr = canonical[keep]
+    meta_lr = meta.iloc[np.where(keep)[0]].reset_index(drop=True)
+
+    present = sorted(set(y_lr.tolist()))
+    if present != ["left_hand", "right_hand"]:
+        raise ValueError(
+            f"Dataset {dataset_name} does not contain both left and right classes after filtering: {present}"
+        )
+
+    return x_lr, y_lr, meta_lr
+
+
 def load_moabb_motor_imagery_dataset(
     dataset_name: str = "bnci2014_001",
     data_path: str | None = None,
@@ -862,23 +609,15 @@ def load_moabb_motor_imagery_dataset(
     **legacy_options: Any,
 ) -> Any:
     """
-    Load EEG data from MOABB MotorImagery paradigms.
+    Load EEG data from MOABB motor imagery datasets.
 
     Returns:
         x: (N, C, T) float32
         y: (N,) int64
         subject_id: (N,) int64
         subjects: available subject IDs
-
-    options:
-        - compact configuration object for MOABB loading.
-        - use `MoabbLoadOptions(...)` to override defaults.
-
-    legacy_options:
-        - backward-compatible keyword overrides for `MoabbLoadOptions` fields.
     """
     opts = _resolve_moabb_load_options(options, legacy_options)
-    class_policy = opts.class_policy
 
     from moabb.datasets import BNCI2014_001, Cho2017, Lee2019_MI, PhysionetMI
     from moabb.paradigms import MotorImagery
@@ -904,35 +643,41 @@ def load_moabb_motor_imagery_dataset(
 
     resolved_data_path = _configure_moabb_data_path(data_path)
 
-    if opts.class_policy == "all_mi":
+    class_policy = str(opts.class_policy).strip().lower()
+    channels = _COMMON_CHANNELS if opts.use_common_channels else None
+
+    if class_policy == "left_right":
+        if LeftRightImagery is not None:
+            paradigm = LeftRightImagery(
+                fmin=opts.fmin,
+                fmax=opts.fmax,
+                tmin=opts.tmin,
+                tmax=opts.tmax,
+                resample=opts.resample,
+                channels=channels,
+            )
+        else:
+            paradigm = MotorImagery(
+                events=["left_hand", "right_hand"],
+                n_classes=2,
+                fmin=opts.fmin,
+                fmax=opts.fmax,
+                tmin=opts.tmin,
+                tmax=opts.tmax,
+                resample=opts.resample,
+                channels=channels,
+            )
+    elif class_policy == "all":
         paradigm = MotorImagery(
             fmin=opts.fmin,
             fmax=opts.fmax,
             tmin=opts.tmin,
             tmax=opts.tmax,
             resample=opts.resample,
-            channels=_COMMON_CHANNELS,
-        )
-    elif LeftRightImagery is not None:
-        paradigm = LeftRightImagery(
-            fmin=opts.fmin,
-            fmax=opts.fmax,
-            tmin=opts.tmin,
-            tmax=opts.tmax,
-            resample=opts.resample,
-            channels=_COMMON_CHANNELS,
+            channels=channels,
         )
     else:
-        paradigm = MotorImagery(
-            events=["left_hand", "right_hand"],
-            n_classes=2,
-            fmin=opts.fmin,
-            fmax=opts.fmax,
-            tmin=opts.tmin,
-            tmax=opts.tmax,
-            resample=opts.resample,
-            channels=_COMMON_CHANNELS,
-        )
+        raise ValueError("Unsupported class_policy. Use one of: all, left_right")
 
     available_subjects = [int(s) for s in dataset.subject_list]
     selected_subjects = available_subjects
@@ -951,7 +696,6 @@ def load_moabb_motor_imagery_dataset(
         raise ValueError("subject_load_retries must be >= 0")
 
     loader_logger = logging.getLogger(__name__)
-    dataset_key = str(getattr(dataset, "code", dataset_name)).lower()
     cache_reuse_control: dict[str, bool] = {"enabled": True}
 
     def _subject_data_paths(sid: int, force_update: bool = False) -> list[Path]:
@@ -981,7 +725,6 @@ def load_moabb_motor_imagery_dataset(
 
     def _load_one_subject(sid: int) -> tuple[np.ndarray, np.ndarray, Any]:
         attempts = int(opts.subject_load_retries) + 1
-        last_error: Exception | None = None
         for attempt in range(attempts):
             try:
                 with warnings.catch_warnings(record=True) as caught:
@@ -1022,6 +765,10 @@ def load_moabb_motor_imagery_dataset(
                 raise RuntimeError(
                     f"Failed loading {dataset_name} subject={int(sid)}: {exc}"
                 ) from exc
+
+        raise RuntimeError(
+            f"Failed loading {dataset_name} subject={int(sid)} after retries"
+        )
 
     with ExitStack() as stack:
         cache_reuse_control = stack.enter_context(_cache_first_pooch_retrieve_context())
@@ -1064,150 +811,17 @@ def load_moabb_motor_imagery_dataset(
             meta=meta,
             dataset_name=dataset_name,
         )
-    elif class_policy == "all_mi":
-        y = _canonicalize_labels(y)
-        if int(x.shape[0]) == 0:
-            raise ValueError(f"Dataset {dataset_name} has no trials after loading")
     else:
-        raise ValueError(
-            f"Unsupported class_policy={class_policy}. Use one of: left_right, all_mi"
-        )
+        y = np.asarray([_canonical_motor_imagery_label(v) for v in y], dtype=object)
+
+    # Common average reference keeps preprocessing consistent across datasets.
+    x = x - x.mean(axis=1, keepdims=True)
 
     selected_subjects = sorted(meta["subject"].astype(int).unique().tolist())
-    if class_policy == "left_right":
-        label_map = {"left_hand": 0, "right_hand": 1}
-    else:
-        classes = sorted(set(str(label) for label in y.tolist()))
-        label_map = {label: idx for idx, label in enumerate(classes)}
+    unique_labels = sorted(set([str(label) for label in y]))
+    label_map = {label: idx for idx, label in enumerate(unique_labels)}
     y_int = np.asarray([label_map[str(label)] for label in y], dtype=np.int64)
     s_int = meta["subject"].to_numpy(dtype=np.int64)
 
-    if not opts.include_metadata:
-        return x.astype(np.float32), y_int, s_int, selected_subjects
-
-    metadata: dict[str, Any] = {}
-    if "session" in meta.columns:
-        session_id, session_map = _encode_meta_column(meta["session"].to_numpy())
-        metadata["session_id"] = session_id
-        metadata["session_map"] = session_map
-    if "run" in meta.columns:
-        run_id, run_map = _encode_meta_column(meta["run"].to_numpy())
-        metadata["run_id"] = run_id
-        metadata["run_map"] = run_map
-
-    return x.astype(np.float32), y_int, s_int, selected_subjects, metadata
-
-
-def subsample_train_trials_per_subject_class(
-    x: np.ndarray,
-    y: np.ndarray,
-    subject_id: np.ndarray,
-    fraction: float,
-    random_state: int = 42,
-    min_trials_per_class: int = 2,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Subsample trials with stratification per subject and per class.
-
-    Args:
-        x: (N, C, T)
-        y: (N,)
-        subject_id: (N,)
-        fraction: keep ratio in (0, 1]
-    """
-    if not (0.0 < fraction <= 1.0):
-        raise ValueError("fraction must be in (0, 1]")
-    if fraction >= 1.0:
-        return x, y, subject_id
-
-    rng = np.random.default_rng(random_state)
-    keep_indices: list[np.ndarray] = []
-
-    for sid in np.unique(subject_id):
-        sid_mask = subject_id == sid
-        y_sid = y[sid_mask]
-        sid_indices = np.where(sid_mask)[0]
-
-        for cls in np.unique(y_sid):
-            cls_local = np.where(y_sid == cls)[0]
-            cls_global = sid_indices[cls_local]
-            n_total = cls_global.shape[0]
-            n_keep = max(min_trials_per_class, int(round(n_total * fraction)))
-            n_keep = min(n_keep, n_total)
-            chosen = rng.choice(cls_global, size=n_keep, replace=False)
-            keep_indices.append(np.sort(chosen))
-
-    if not keep_indices:
-        raise ValueError("No samples selected after subsampling")
-
-    final_idx = np.concatenate(keep_indices)
-    final_idx.sort()
-    return x[final_idx], y[final_idx], subject_id[final_idx]
-
-
-
-
-# uv run training/pretrain_cross_dataset.py \
-#   --source_datasets physionetmi cho2017 lee2019_mi \
-#   --pretrain_mode ssl \
-#   --domain_mode subject \
-#   --epochs 50 \
-#   --batch_size 32 \
-#   --lr 1e-3 \
-#   --weight_decay 1e-4 \
-#   --val_split 0.2 \
-#   --ssl_weight 1.0 \
-#   --ssl_temperature 0.2 \
-#   --ssl_proj_dim 128 \
-#   --ssl_hidden_dim 256 \
-#   --ssl_noise_std 0.02 \
-#   --ssl_time_mask_ratio 0.1 \
-#   --ssl_domain_loss_weight 0.2 \
-#   --da_lambda_gamma 10.0 \
-#   --loader_euclidean_align \
-#   --model_euclidean_alignment \
-#   --model_riemannian_reweight \
-#   --cnn_out_channels 32 \
-#   --cnn_dropout 0.5 \
-#   --embedding_dim 128 \
-#   --num_heads 4 \
-#   --num_layers 2 \
-#   --dropout 0.1 \
-#   --use_cnn_domain_head \
-#   --cnn_domain_weight 0.1 \
-#   --num_workers 4 \
-#   --seed 42 \
-#   --deterministic \
-#   --subject_load_retries 2 \
-#   --redownload_on_failure \
-#   --data_path "/data/istiaqfuad/mne_data" \
-#   --output_dir "results/pretrain_cross_dataset" \
-#   --tag "ssl_final"
-
-
-
-# uv run training/pretrain_cross_dataset.py \
-#   --source_datasets physionetmi cho2017 lee2019_mi \
-#   --pretrain_mode ssl \
-#   --domain_mode subject \
-#   --validation_strategy subject_fold \
-#   --subject_val_folds 5 \
-#   --subject_val_fold_index 0 \
-#   --reject_artifact_trials \
-#   --artifact_z_threshold 3.5 \
-#   --subject_balanced_sampling \
-#   --loader_euclidean_align \
-#   --model_euclidean_alignment \
-#   --model_riemannian_reweight \
-#   --epochs 80 \
-#   --batch_size 32 \
-#   --lr 1e-3 \
-#   --weight_decay 1e-4 \
-#   --ssl_domain_loss_weight 0.15 \
-#   --da_lambda_gamma 6 \
-#   --seed 42 \
-#   --deterministic \
-#   --num_workers 4 \
-#   --data_path /data/istiaqfuad/mne_data \
-#   --tag ssl_subjectfold5_fold0_artifactrej_e80 \
-#   --output_dir results/pretrain_cross_dataset
+    x_out = x.astype(np.float32)
+    return x_out, y_int, s_int, selected_subjects

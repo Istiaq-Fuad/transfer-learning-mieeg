@@ -4,8 +4,29 @@ import torch
 from torch import nn
 
 
+class ChannelAttention(nn.Module):
+    """Squeeze-and-excitation style attention over EEG channels after spatial conv."""
+
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        hidden = max(1, channels // reduction)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, t = x.shape
+        w = self.pool(x).view(b, c)
+        w = self.fc(w).view(b, c, 1, 1)
+        return x * w
+
+
 class CNNBlock(nn.Module):
-    """EEG CNN block with multi-scale temporal conv + depthwise spatial conv."""
+    """EEG CNN block with multi-scale temporal conv + depthwise spatial conv + channel attention."""
 
     def __init__(
         self,
@@ -73,6 +94,8 @@ class CNNBlock(nn.Module):
         )
         self.spatial_bn = nn.BatchNorm2d(out_channels)
 
+        self.channel_attn = ChannelAttention(out_channels)
+
         self.residual_proj = nn.Conv2d(
             in_channels=1,
             out_channels=out_channels,
@@ -103,6 +126,7 @@ class CNNBlock(nn.Module):
         main = torch.cat(temporal_feats, dim=1)
         main = self.temporal_merge(main)
         main = self.spatial_bn(self.spatial_conv(main))
+        main = self.channel_attn(main)
 
         # 1x1 projection matches channel count; average over spatial axis to match height=1.
         residual = self.residual_proj(x).mean(dim=2, keepdim=True)
