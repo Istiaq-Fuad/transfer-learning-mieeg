@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import math
@@ -11,7 +12,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import cohen_kappa_score
+from sklearn.metrics import cohen_kappa_score, confusion_matrix, f1_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from torch import nn
@@ -28,6 +29,7 @@ try:
         create_within_subject_dataloaders,
         load_moabb_motor_imagery_dataset,
     )
+    from models.heads import CalibrationLayer
     from models.model import EEGModel
     from training.utils import apply_euclidean_alignment, fit_euclidean_alignment
     from utils.reproducibility import set_seed_everywhere
@@ -47,6 +49,7 @@ except ModuleNotFoundError:
         create_within_subject_dataloaders,
         load_moabb_motor_imagery_dataset,
     )
+    from models.heads import CalibrationLayer
     from models.model import EEGModel
     from training.utils import apply_euclidean_alignment, fit_euclidean_alignment
     from utils.reproducibility import set_seed_everywhere
@@ -141,6 +144,33 @@ def _mixup_loss(
     return lam * criterion(preds, y_a) + (1.0 - lam) * criterion(preds, y_b)
 
 
+def _set_cnn_requires_grad(model: nn.Module, requires_grad: bool) -> None:
+    for param in model.cnn.parameters():
+        param.requires_grad = requires_grad
+
+
+def _split_calibration_indices(
+    labels: np.ndarray,
+    calibration_trials: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    total = labels.shape[0]
+    if total <= 1:
+        return np.arange(total), np.array([], dtype=int)
+
+    calibration_trials = int(min(calibration_trials, total - 1))
+    indices = np.arange(total)
+    unique_y, counts = np.unique(labels, return_counts=True)
+    stratify = labels if unique_y.shape[0] > 1 and np.min(counts) >= 2 else None
+    calib_idx, eval_idx = train_test_split(
+        indices,
+        train_size=calibration_trials,
+        random_state=seed,
+        stratify=stratify,
+    )
+    return np.asarray(calib_idx), np.asarray(eval_idx)
+
+
 def setup_logger(output_dir: Path) -> logging.Logger:
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("train")
@@ -165,8 +195,11 @@ def evaluate(
     model: nn.Module,
     data_loader: torch.utils.data.DataLoader,
     device: torch.device,
+    calibration: nn.Module | None = None,
 ) -> dict[str, float]:
     model.eval()
+    if calibration is not None:
+        calibration.eval()
     total = 0
     correct = 0
     y_true: list[int] = []
@@ -178,6 +211,8 @@ def evaluate(
 
         outputs = model(x, lambda_=0.0)
         logits = outputs["task"]
+        if calibration is not None:
+            logits = model.task_head(calibration(outputs["features"]))
         preds = logits.argmax(dim=1)
 
         total += y.size(0)
@@ -187,7 +222,100 @@ def evaluate(
 
     accuracy = correct / max(total, 1)
     kappa = cohen_kappa_score(y_true, y_pred) if total > 0 else 0.0
-    return {"accuracy": float(accuracy), "kappa": float(kappa)}
+    if total > 0:
+        f1_macro = f1_score(y_true, y_pred, average="macro", zero_division=0)
+        f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0).tolist()
+        cmatrix = confusion_matrix(y_true, y_pred).tolist()
+    else:
+        f1_macro = 0.0
+        f1_per_class = []
+        cmatrix = []
+    return {
+        "accuracy": float(accuracy),
+        "kappa": float(kappa),
+        "f1_macro": float(f1_macro),
+        "f1_per_class": f1_per_class,
+        "confusion_matrix": cmatrix,
+    }
+
+
+def calibrate_model(
+    model: EEGModel,
+    test_dataset: EEGDataset | Subset,
+    device: torch.device,
+    calibration_trials: int,
+    calibration_steps: int,
+    calibration_lr: float,
+    calibration_weight_decay: float,
+    calibration_label_smoothing: float,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+) -> tuple[CalibrationLayer | None, dict[str, float] | None]:
+    if calibration_trials <= 0 or calibration_steps <= 0:
+        return None, None
+
+    if isinstance(test_dataset, Subset):
+        base = test_dataset.dataset
+        indices = np.asarray(test_dataset.indices)
+        x = base.x[indices]
+        y = base.y[indices]
+        subject_id = base.subject_id[indices]
+        full_dataset = EEGDataset(x, y, subject_id)
+    else:
+        full_dataset = test_dataset
+
+    labels = full_dataset.y.detach().cpu().numpy()
+    calib_idx, eval_idx = _split_calibration_indices(labels, calibration_trials, seed)
+    if calib_idx.size == 0 or eval_idx.size == 0:
+        return None, None
+
+    calib_dataset = Subset(full_dataset, calib_idx)
+    eval_dataset = Subset(full_dataset, eval_idx)
+
+    calib_loader = DataLoader(
+        calib_dataset,
+        batch_size=min(batch_size, len(calib_dataset)),
+        shuffle=True,
+        num_workers=num_workers,
+    )
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+
+    calibration = CalibrationLayer(model.embedding_dim).to(device)
+    optimizer = AdamW(
+        calibration.parameters(),
+        lr=calibration_lr,
+        weight_decay=calibration_weight_decay,
+    )
+    criterion = nn.CrossEntropyLoss(label_smoothing=calibration_label_smoothing)
+
+    model.eval()
+    calibration.train()
+    for _ in range(calibration_steps):
+        for x, y, _ in calib_loader:
+            x = x.to(device)
+            y = y.to(device)
+            with torch.no_grad():
+                feats = model(x, lambda_=0.0)["features"]
+            logits = model.task_head(calibration(feats))
+            loss = criterion(logits, y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    calibrated_metrics = evaluate(
+        model,
+        eval_loader,
+        device,
+        calibration=calibration,
+    )
+    return calibration, calibrated_metrics
 
 
 def train_one_subject(
@@ -215,6 +343,7 @@ def train_one_subject(
     augment_crop_ratio: float,
     augment_noise_sigma: float,
     augment_channel_dropout: float,
+    freeze_cnn_epochs: int,
     logger: logging.Logger,
 ) -> tuple[dict[str, float], list[dict[str, float]]]:
     model.to(device)
@@ -253,7 +382,12 @@ def train_one_subject(
     best_row: dict[str, float] | None = None
     epochs_without_improvement = 0
 
+    if freeze_cnn_epochs > 0:
+        _set_cnn_requires_grad(model, False)
+
     for epoch in range(epochs):
+        if freeze_cnn_epochs > 0 and epoch == freeze_cnn_epochs:
+            _set_cnn_requires_grad(model, True)
         model.train()
         running_loss = 0.0
         n_samples = 0
@@ -317,11 +451,15 @@ def train_one_subject(
                 "train_loss": float(train_loss),
                 "test_accuracy": test_metrics["accuracy"],
                 "test_kappa": test_metrics["kappa"],
+                "test_f1_macro": test_metrics["f1_macro"],
+                "test_f1_per_class": test_metrics["f1_per_class"],
+                "test_confusion_matrix": test_metrics["confusion_matrix"],
                 "lr": float(optimizer.param_groups[0]["lr"]),
             }
             if val_metrics is not None:
                 best_row["val_accuracy"] = val_metrics["accuracy"]
                 best_row["val_kappa"] = val_metrics["kappa"]
+                best_row["val_f1_macro"] = val_metrics["f1_macro"]
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -331,11 +469,15 @@ def train_one_subject(
             "train_loss": float(train_loss),
             "test_accuracy": test_metrics["accuracy"],
             "test_kappa": test_metrics["kappa"],
+            "test_f1_macro": test_metrics["f1_macro"],
+            "test_f1_per_class": test_metrics["f1_per_class"],
+            "test_confusion_matrix": test_metrics["confusion_matrix"],
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
         if val_metrics is not None:
             row["val_accuracy"] = val_metrics["accuracy"]
             row["val_kappa"] = val_metrics["kappa"]
+            row["val_f1_macro"] = val_metrics["f1_macro"]
         history.append(row)
 
         if val_metrics is None:
@@ -518,7 +660,12 @@ def _parse_subjects(value: str | None) -> list[int] | None:
     return [int(v.strip()) for v in value.split(",") if v.strip()]
 
 
-def _build_model(num_channels: int, num_classes: int, num_subjects: int) -> EEGModel:
+def _build_model(
+    num_channels: int,
+    num_classes: int,
+    num_subjects: int,
+    use_rope: bool,
+) -> EEGModel:
     return EEGModel(
         num_channels=num_channels,
         num_classes=num_classes,
@@ -536,6 +683,7 @@ def _build_model(num_channels: int, num_classes: int, num_subjects: int) -> EEGM
         use_attention_pool=DEFAULT_MODEL_CONFIG["use_attention_pool"],
         attention_mix_init=DEFAULT_MODEL_CONFIG["attention_mix_init"],
         learnable_attention_mix=DEFAULT_MODEL_CONFIG["learnable_attention_mix"],
+        use_rope=use_rope,
     )
 
 
@@ -595,6 +743,8 @@ def run(args: argparse.Namespace) -> None:
     )
 
     per_subject: dict[str, Any] = {}
+    per_subject_raw: dict[str, Any] = {}
+    per_subject_calibrated: dict[str, Any] = {}
     histories: dict[str, list[dict[str, float]]] = {}
     per_subject_folds: dict[str, list[dict[str, float]]] = {}
 
@@ -606,6 +756,70 @@ def run(args: argparse.Namespace) -> None:
         base_lr = args.within_lr
         base_weight_decay = args.within_weight_decay
         base_label_smoothing = args.within_label_smoothing
+
+    pretrained_state: dict[str, torch.Tensor] | None = None
+    if args.protocol == "loso" and args.two_phase_loso and args.pretrain_epochs > 0:
+        logger.info("Starting cross-subject pretraining")
+        pretrain_dataset = EEGDataset(x, y, subject_ids)
+        whitening = fit_euclidean_alignment(
+            pretrain_dataset.x,
+            eps=loader_options.align_eps,
+        )
+        pretrain_dataset.x = apply_euclidean_alignment(pretrain_dataset.x, whitening)
+        pretrain_loader, pretrain_val = _split_train_val_loaders(
+            dataset=pretrain_dataset,
+            val_size=args.pretrain_val_size,
+            seed=args.seed,
+            batch_size=args.batch_size,
+            subject_balanced_sampling=args.subject_balanced_sampling,
+            drop_last_train=args.drop_last_train,
+            num_workers=args.num_workers,
+            deterministic=True,
+        )
+        pretrain_test = pretrain_val if pretrain_val is not None else pretrain_loader
+        pretrain_model = _build_model(
+            num_channels,
+            num_classes,
+            num_subjects,
+            use_rope=args.use_rope,
+        )
+        pretrain_best, pretrain_history = train_one_subject(
+            model=pretrain_model,
+            train_loader=pretrain_loader,
+            val_loader=pretrain_val,
+            test_loader=pretrain_test,
+            device=device,
+            epochs=args.pretrain_epochs,
+            lr=args.pretrain_lr,
+            weight_decay=args.pretrain_weight_decay,
+            label_smoothing=base_label_smoothing,
+            use_class_weights=args.use_class_weights,
+            selection_metric=args.selection_metric,
+            patience=args.patience,
+            min_delta=args.min_delta,
+            lr_schedule=args.lr_schedule,
+            warmup_epochs=args.warmup_epochs,
+            eta_min=args.eta_min,
+            use_domain_loss=False,
+            domain_lambda_max=0.0,
+            domain_loss_weight=0.0,
+            mixup_alpha=args.mixup_alpha,
+            augment=args.augment,
+            augment_crop_ratio=args.augment_crop_ratio,
+            augment_noise_sigma=args.augment_noise_sigma,
+            augment_channel_dropout=args.augment_channel_dropout,
+            freeze_cnn_epochs=0,
+            logger=logger,
+        )
+        pretrained_state = copy.deepcopy(pretrain_model.state_dict())
+        (run_dir / "pretrain_summary.json").write_text(
+            json.dumps(pretrain_best, indent=2),
+            encoding="utf-8",
+        )
+        (run_dir / "pretrain_history.json").write_text(
+            json.dumps(pretrain_history, indent=2),
+            encoding="utf-8",
+        )
 
     for idx, subject in enumerate(selected_subjects, start=1):
         logger.info(
@@ -704,16 +918,27 @@ def run(args: argparse.Namespace) -> None:
                     num_workers=args.num_workers,
                 )
 
-                model = _build_model(num_channels, num_classes, num_subjects)
+                model = _build_model(
+                    num_channels,
+                    num_classes,
+                    num_subjects,
+                    use_rope=args.use_rope,
+                )
+                if pretrained_state is not None:
+                    model.load_state_dict(pretrained_state)
                 best, history = train_one_subject(
                     model=model,
                     train_loader=train_loader,
                     val_loader=val_loader,
                     test_loader=test_loader,
                     device=device,
-                    epochs=args.epochs,
-                    lr=base_lr,
-                    weight_decay=base_weight_decay,
+                    epochs=args.finetune_epochs if args.two_phase_loso else args.epochs,
+                    lr=args.finetune_lr if args.two_phase_loso else base_lr,
+                    weight_decay=(
+                        args.finetune_weight_decay
+                        if args.two_phase_loso
+                        else base_weight_decay
+                    ),
                     label_smoothing=base_label_smoothing,
                     use_class_weights=args.use_class_weights,
                     selection_metric=args.selection_metric,
@@ -730,6 +955,9 @@ def run(args: argparse.Namespace) -> None:
                     augment_crop_ratio=args.augment_crop_ratio,
                     augment_noise_sigma=args.augment_noise_sigma,
                     augment_channel_dropout=args.augment_channel_dropout,
+                    freeze_cnn_epochs=(
+                        args.finetune_freeze_cnn_epochs if args.two_phase_loso else 0
+                    ),
                     logger=logger,
                 )
                 fold_rows.append(best)
@@ -768,16 +996,25 @@ def run(args: argparse.Namespace) -> None:
             deterministic=True,
         )
 
-        model = _build_model(num_channels, num_classes, num_subjects)
+        model = _build_model(
+            num_channels,
+            num_classes,
+            num_subjects,
+            use_rope=args.use_rope,
+        )
+        if pretrained_state is not None:
+            model.load_state_dict(pretrained_state)
         best, history = train_one_subject(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
             test_loader=test_loader,
             device=device,
-            epochs=args.epochs,
-            lr=base_lr,
-            weight_decay=base_weight_decay,
+            epochs=args.finetune_epochs if args.two_phase_loso else args.epochs,
+            lr=args.finetune_lr if args.two_phase_loso else base_lr,
+            weight_decay=(
+                args.finetune_weight_decay if args.two_phase_loso else base_weight_decay
+            ),
             label_smoothing=base_label_smoothing,
             use_class_weights=args.use_class_weights,
             selection_metric=args.selection_metric,
@@ -794,14 +1031,48 @@ def run(args: argparse.Namespace) -> None:
             augment_crop_ratio=args.augment_crop_ratio,
             augment_noise_sigma=args.augment_noise_sigma,
             augment_channel_dropout=args.augment_channel_dropout,
+            freeze_cnn_epochs=(
+                args.finetune_freeze_cnn_epochs if args.two_phase_loso else 0
+            ),
             logger=logger,
         )
 
-        per_subject[str(subject)] = best
+        per_subject_raw[str(subject)] = best
         histories[str(subject)] = history
 
-    accs = [row["test_accuracy"] for row in per_subject.values()]
-    kappas = [row["test_kappa"] for row in per_subject.values()]
+        if args.protocol == "loso" and args.calibration_trials > 0:
+            _, calibrated_metrics = calibrate_model(
+                model=model,
+                test_dataset=test_loader.dataset,
+                device=device,
+                calibration_trials=args.calibration_trials,
+                calibration_steps=args.calibration_steps,
+                calibration_lr=args.calibration_lr,
+                calibration_weight_decay=args.calibration_weight_decay,
+                calibration_label_smoothing=args.calibration_label_smoothing,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                seed=args.seed,
+            )
+            if calibrated_metrics is not None:
+                per_subject_calibrated[str(subject)] = calibrated_metrics
+                per_subject[str(subject)] = calibrated_metrics
+            else:
+                per_subject[str(subject)] = best
+        else:
+            per_subject[str(subject)] = best
+
+    def _metric(row: dict[str, float], key: str) -> float:
+        if key in row:
+            return float(row[key])
+        if key == "test_accuracy":
+            return float(row.get("accuracy", 0.0))
+        if key == "test_kappa":
+            return float(row.get("kappa", 0.0))
+        return 0.0
+
+    accs = [_metric(row, "test_accuracy") for row in per_subject.values()]
+    kappas = [_metric(row, "test_kappa") for row in per_subject.values()]
     summary = {
         "protocol": args.protocol,
         "dataset": args.dataset,
@@ -816,6 +1087,10 @@ def run(args: argparse.Namespace) -> None:
     }
     if per_subject_folds:
         summary["per_subject_folds"] = per_subject_folds
+    if per_subject_raw:
+        summary["per_subject_raw"] = per_subject_raw
+    if per_subject_calibrated:
+        summary["per_subject_calibrated"] = per_subject_calibrated
 
     (run_dir / "summary.json").write_text(
         json.dumps(summary, indent=2),
@@ -875,6 +1150,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eta_min", type=float, default=1e-6)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--within_label_smoothing", type=float, default=0.1)
+    parser.add_argument(
+        "--no_rope", dest="use_rope", action="store_false", default=True
+    )
     parser.add_argument("--domain_loss_weight", type=float, default=0.1)
     parser.add_argument("--domain_lambda_max", type=float, default=0.3)
     parser.add_argument("--mixup_alpha", type=float, default=0.2)
@@ -890,6 +1168,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--augment_crop_ratio", type=float, default=0.85)
     parser.add_argument("--augment_noise_sigma", type=float, default=0.01)
     parser.add_argument("--augment_channel_dropout", type=float, default=0.05)
+    parser.add_argument("--two_phase_loso", action="store_true", default=False)
+    parser.add_argument("--pretrain_epochs", type=int, default=50)
+    parser.add_argument("--pretrain_lr", type=float, default=1e-3)
+    parser.add_argument("--pretrain_weight_decay", type=float, default=1e-4)
+    parser.add_argument("--pretrain_val_size", type=float, default=0.1)
+    parser.add_argument("--finetune_epochs", type=int, default=20)
+    parser.add_argument("--finetune_lr", type=float, default=1e-4)
+    parser.add_argument("--finetune_weight_decay", type=float, default=1e-4)
+    parser.add_argument("--finetune_freeze_cnn_epochs", type=int, default=5)
+    parser.add_argument("--calibration_trials", type=int, default=0)
+    parser.add_argument("--calibration_steps", type=int, default=50)
+    parser.add_argument("--calibration_lr", type=float, default=1e-3)
+    parser.add_argument("--calibration_weight_decay", type=float, default=0.0)
+    parser.add_argument("--calibration_label_smoothing", type=float, default=0.0)
     parser.add_argument(
         "--no_class_weights",
         dest="use_class_weights",

@@ -29,6 +29,7 @@ class EEGModel(nn.Module):
         use_attention_pool: bool = False,
         attention_mix_init: float = 0.5,
         learnable_attention_mix: bool = False,
+        use_rope: bool = True,
         domain_head_hidden_dim: int = 0,
         domain_head_layers: int = 1,
         domain_head_dropout: float = 0.0,
@@ -63,6 +64,7 @@ class EEGModel(nn.Module):
             num_layers=num_layers,
             dropout=dropout,
             use_positional_encoding=True,
+            use_rope=use_rope,
         )
 
         if use_attention_pool:

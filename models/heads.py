@@ -83,3 +83,13 @@ class DomainHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.classifier(x)
+
+
+class CalibrationLayer(nn.Module):
+    def __init__(self, feature_dim: int) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(feature_dim))
+        self.bias = nn.Parameter(torch.zeros(feature_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.scale + self.bias
