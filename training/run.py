@@ -3,17 +3,20 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sklearn.metrics import cohen_kappa_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 from torch import nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 try:
@@ -63,6 +66,79 @@ DEFAULT_MODEL_CONFIG = {
     "attention_mix_init": 0.7,
     "learnable_attention_mix": True,
 }
+
+
+def _grl_lambda(epoch: int, total_epochs: int, lambda_max: float) -> float:
+    if total_epochs <= 1:
+        return float(lambda_max)
+    p = epoch / max(1, total_epochs - 1)
+    return float(lambda_max) * (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0)
+
+
+def _apply_augmentations(
+    x: torch.Tensor,
+    crop_ratio: float,
+    noise_sigma: float,
+    channel_dropout: float,
+) -> torch.Tensor:
+    original_len = x.size(-1)
+
+    if 0.0 < crop_ratio < 1.0:
+        crop_len = max(1, int(original_len * crop_ratio))
+        if crop_len < original_len:
+            start = torch.randint(
+                0,
+                original_len - crop_len + 1,
+                (1,),
+                device=x.device,
+            ).item()
+            x = x[..., start : start + crop_len]
+            x = F.interpolate(
+                x,
+                size=original_len,
+                mode="linear",
+                align_corners=False,
+            )
+
+    if noise_sigma > 0.0:
+        scale = x.std(dim=-1, keepdim=True).clamp_min(1e-6)
+        x = x + torch.randn_like(x) * (scale * noise_sigma)
+
+    if channel_dropout > 0.0:
+        keep_prob = 1.0 - channel_dropout
+        mask = torch.bernoulli(
+            torch.full(
+                (x.size(0), x.size(1), 1),
+                keep_prob,
+                device=x.device,
+            )
+        )
+        x = x * mask
+
+    return x
+
+
+def _feature_mixup(
+    tokens: torch.Tensor,
+    labels: torch.Tensor,
+    alpha: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    if alpha <= 0.0:
+        return tokens, labels, labels, 1.0
+    lam = float(np.random.beta(alpha, alpha))
+    index = torch.randperm(tokens.size(0), device=tokens.device)
+    mixed = lam * tokens + (1.0 - lam) * tokens[index]
+    return mixed, labels, labels[index], lam
+
+
+def _mixup_loss(
+    criterion: nn.Module,
+    preds: torch.Tensor,
+    y_a: torch.Tensor,
+    y_b: torch.Tensor,
+    lam: float,
+) -> torch.Tensor:
+    return lam * criterion(preds, y_a) + (1.0 - lam) * criterion(preds, y_b)
 
 
 def setup_logger(output_dir: Path) -> logging.Logger:
@@ -124,19 +200,54 @@ def train_one_subject(
     lr: float,
     weight_decay: float,
     label_smoothing: float,
+    use_class_weights: bool,
     selection_metric: str,
     patience: int,
     min_delta: float,
     lr_schedule: str,
+    warmup_epochs: int,
+    eta_min: float,
+    use_domain_loss: bool,
+    domain_lambda_max: float,
+    domain_loss_weight: float,
+    mixup_alpha: float,
+    augment: bool,
+    augment_crop_ratio: float,
+    augment_noise_sigma: float,
+    augment_channel_dropout: float,
     logger: logging.Logger,
 ) -> tuple[dict[str, float], list[dict[str, float]]]:
-    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = None
-    if lr_schedule == "cosine":
-        scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs))
-
     model.to(device)
+
+    weights_tensor = None
+    if use_class_weights:
+        labels = _extract_labels_from_loader(train_loader)
+        if labels is not None:
+            classes = np.unique(labels)
+            if classes.shape[0] > 1:
+                weights = compute_class_weight(
+                    class_weight="balanced",
+                    classes=classes,
+                    y=labels,
+                )
+                weights_tensor = torch.tensor(
+                    weights,
+                    dtype=torch.float32,
+                    device=device,
+                )
+
+    criterion = nn.CrossEntropyLoss(
+        label_smoothing=label_smoothing,
+        weight=weights_tensor,
+    )
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = _build_scheduler(
+        optimizer=optimizer,
+        epochs=epochs,
+        warmup_epochs=warmup_epochs,
+        eta_min=eta_min,
+        schedule=lr_schedule,
+    )
     history: list[dict[str, float]] = []
     best_score = float("-inf")
     best_row: dict[str, float] | None = None
@@ -146,14 +257,41 @@ def train_one_subject(
         model.train()
         running_loss = 0.0
         n_samples = 0
+        grl_lambda = (
+            _grl_lambda(epoch, epochs, domain_lambda_max) if use_domain_loss else 0.0
+        )
+        use_mixup = mixup_alpha > 0.0
 
-        for x, y, _ in train_loader:
+        for x, y, subject_id in train_loader:
             x = x.to(device)
             y = y.to(device)
+            subject_id = subject_id.to(device)
 
-            outputs = model(x, lambda_=0.0)
-            logits = outputs["task"]
-            loss = criterion(logits, y)
+            if augment:
+                x = _apply_augmentations(
+                    x,
+                    crop_ratio=augment_crop_ratio,
+                    noise_sigma=augment_noise_sigma,
+                    channel_dropout=augment_channel_dropout,
+                )
+
+            if use_mixup:
+                tokens, cnn_domain_output = model.encode_tokens(x, lambda_=grl_lambda)
+                mixed_tokens, y_a, y_b, mix_lam = _feature_mixup(tokens, y, mixup_alpha)
+                outputs = model.forward_from_tokens(
+                    mixed_tokens,
+                    lambda_=grl_lambda,
+                    cnn_domain_output=cnn_domain_output,
+                )
+                task_loss = _mixup_loss(criterion, outputs["task"], y_a, y_b, mix_lam)
+            else:
+                outputs = model(x, lambda_=grl_lambda)
+                task_loss = criterion(outputs["task"], y)
+
+            loss = task_loss
+            if use_domain_loss:
+                domain_loss = F.cross_entropy(outputs["domain"], subject_id)
+                loss = loss + domain_loss_weight * domain_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -324,6 +462,56 @@ def _aggregate_fold_metrics(rows: list[dict[str, float]]) -> dict[str, float]:
     }
 
 
+def _extract_labels_from_loader(
+    loader: DataLoader,
+) -> np.ndarray | None:
+    dataset = loader.dataset
+    if isinstance(dataset, Subset):
+        base = dataset.dataset
+        indices = np.asarray(dataset.indices)
+        if hasattr(base, "y"):
+            labels = base.y.detach().cpu().numpy()
+            return labels[indices]
+        return None
+    if hasattr(dataset, "y"):
+        return dataset.y.detach().cpu().numpy()
+    return None
+
+
+def _build_scheduler(
+    optimizer: AdamW,
+    epochs: int,
+    warmup_epochs: int,
+    eta_min: float,
+    schedule: str,
+) -> LambdaLR | CosineAnnealingLR | None:
+    if schedule == "none":
+        return None
+    if schedule == "cosine":
+        return CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=eta_min)
+
+    total_epochs = max(1, epochs)
+    if total_epochs <= 1:
+        return None
+
+    warmup_steps = max(1, min(int(warmup_epochs), total_epochs - 1))
+    start_factor = 0.1
+    base_lr = optimizer.param_groups[0]["lr"]
+
+    def lr_lambda(epoch: int) -> float:
+        if epoch < warmup_steps:
+            progress = (epoch + 1) / warmup_steps
+            return start_factor + (1.0 - start_factor) * progress
+
+        remaining = max(1, total_epochs - warmup_steps)
+        t = epoch - warmup_steps
+        cosine = 0.5 * (1.0 + math.cos(math.pi * t / remaining))
+        lr = eta_min + (base_lr - eta_min) * cosine
+        return lr / base_lr
+
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
 def _parse_subjects(value: str | None) -> list[int] | None:
     if not value:
         return None
@@ -390,7 +578,7 @@ def run(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         test_size=args.test_size,
         random_state=args.seed,
-        apply_euclidean_align=not args.no_euclidean_align,
+        apply_euclidean_align=True,
         subject_balanced_sampling=args.subject_balanced_sampling,
         drop_last_train=args.drop_last_train,
         num_workers=args.num_workers,
@@ -413,6 +601,7 @@ def run(args: argparse.Namespace) -> None:
     base_lr = args.lr
     base_weight_decay = args.weight_decay
     base_label_smoothing = args.label_smoothing
+    use_domain_loss = args.protocol == "loso" and args.domain_loss_weight > 0.0
     if args.protocol == "within":
         base_lr = args.within_lr
         base_weight_decay = args.within_weight_decay
@@ -484,18 +673,13 @@ def run(args: argparse.Namespace) -> None:
                     s_test,
                 )
 
-                if loader_options.apply_euclidean_align:
-                    whitening = fit_euclidean_alignment(
-                        train_dataset.x,
-                        eps=loader_options.align_eps,
-                    )
-                    train_dataset.x = apply_euclidean_alignment(
-                        train_dataset.x, whitening
-                    )
-                    val_dataset.x = apply_euclidean_alignment(val_dataset.x, whitening)
-                    test_dataset.x = apply_euclidean_alignment(
-                        test_dataset.x, whitening
-                    )
+                whitening = fit_euclidean_alignment(
+                    train_dataset.x,
+                    eps=loader_options.align_eps,
+                )
+                train_dataset.x = apply_euclidean_alignment(train_dataset.x, whitening)
+                val_dataset.x = apply_euclidean_alignment(val_dataset.x, whitening)
+                test_dataset.x = apply_euclidean_alignment(test_dataset.x, whitening)
 
                 train_loader, val_loader = _split_train_val_loaders(
                     dataset=train_dataset,
@@ -531,10 +715,21 @@ def run(args: argparse.Namespace) -> None:
                     lr=base_lr,
                     weight_decay=base_weight_decay,
                     label_smoothing=base_label_smoothing,
+                    use_class_weights=args.use_class_weights,
                     selection_metric=args.selection_metric,
                     patience=args.patience,
                     min_delta=args.min_delta,
                     lr_schedule=args.lr_schedule,
+                    warmup_epochs=args.warmup_epochs,
+                    eta_min=args.eta_min,
+                    use_domain_loss=use_domain_loss,
+                    domain_lambda_max=args.domain_lambda_max,
+                    domain_loss_weight=args.domain_loss_weight,
+                    mixup_alpha=args.mixup_alpha,
+                    augment=args.augment,
+                    augment_crop_ratio=args.augment_crop_ratio,
+                    augment_noise_sigma=args.augment_noise_sigma,
+                    augment_channel_dropout=args.augment_channel_dropout,
                     logger=logger,
                 )
                 fold_rows.append(best)
@@ -584,10 +779,21 @@ def run(args: argparse.Namespace) -> None:
             lr=base_lr,
             weight_decay=base_weight_decay,
             label_smoothing=base_label_smoothing,
+            use_class_weights=args.use_class_weights,
             selection_metric=args.selection_metric,
             patience=args.patience,
             min_delta=args.min_delta,
             lr_schedule=args.lr_schedule,
+            warmup_epochs=args.warmup_epochs,
+            eta_min=args.eta_min,
+            use_domain_loss=use_domain_loss,
+            domain_lambda_max=args.domain_lambda_max,
+            domain_loss_weight=args.domain_loss_weight,
+            mixup_alpha=args.mixup_alpha,
+            augment=args.augment,
+            augment_crop_ratio=args.augment_crop_ratio,
+            augment_noise_sigma=args.augment_noise_sigma,
+            augment_channel_dropout=args.augment_channel_dropout,
             logger=logger,
         )
 
@@ -662,11 +868,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lr_schedule",
         type=str,
-        default="cosine",
-        choices=["none", "cosine"],
+        default="warmup_cosine",
+        choices=["none", "cosine", "warmup_cosine"],
     )
-    parser.add_argument("--label_smoothing", type=float, default=0.0)
+    parser.add_argument("--warmup_epochs", type=int, default=10)
+    parser.add_argument("--eta_min", type=float, default=1e-6)
+    parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--within_label_smoothing", type=float, default=0.1)
+    parser.add_argument("--domain_loss_weight", type=float, default=0.1)
+    parser.add_argument("--domain_lambda_max", type=float, default=0.3)
+    parser.add_argument("--mixup_alpha", type=float, default=0.2)
+    parser.add_argument(
+        "--no_mixup",
+        dest="mixup_alpha",
+        action="store_const",
+        const=0.0,
+    )
+    parser.add_argument(
+        "--no_augment", dest="augment", action="store_false", default=True
+    )
+    parser.add_argument("--augment_crop_ratio", type=float, default=0.85)
+    parser.add_argument("--augment_noise_sigma", type=float, default=0.01)
+    parser.add_argument("--augment_channel_dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--no_class_weights",
+        dest="use_class_weights",
+        action="store_false",
+        default=True,
+    )
     parser.add_argument(
         "--subject_balanced_sampling", action="store_true", default=False
     )

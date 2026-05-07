@@ -21,6 +21,10 @@ The command-line interface controls:
 - `--data_path`: optional path for MOABB/MNE data caches
 - `--val_size`: validation split size inside the training set
 - `--within_cv_folds`: number of folds for within-subject CV (1 disables CV)
+- `--lr_schedule`: `none`, `cosine`, or `warmup_cosine`
+- `--warmup_epochs`: warmup length for `warmup_cosine`
+- `--eta_min`: minimum LR for cosine schedules
+- `--no_class_weights`: disable class-weighted loss
 - Hyperparameters: `--epochs`, `--batch_size`, `--lr`, `--weight_decay`, etc.
 
 ## 2. Data flow
@@ -59,7 +63,7 @@ The training protocol chooses one of two split functions in `data/loader.py`:
 Both splitters use:
 
 - stratified splits on class labels
-- optional Euclidean alignment via `training.utils.fit_euclidean_alignment(...)`
+- Euclidean alignment via `training.utils.fit_euclidean_alignment(...)` (currently always on)
 - optional subject-balanced sampling in the training loader
 
 ### 2.3 Torch dataset abstraction
@@ -136,8 +140,8 @@ The model also includes:
 ### 4.1 Per-epoch training
 
 - uses `torch.optim.AdamW`
-- `torch.nn.CrossEntropyLoss`
-- optional cosine learning-rate scheduler
+- `torch.nn.CrossEntropyLoss` with optional class weighting and label smoothing
+- optional cosine or warmup+cosine learning-rate scheduler
 - each epoch:
   - forward pass through model
   - compute task loss only

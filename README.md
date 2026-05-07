@@ -22,9 +22,12 @@ Optional flags:
 uv run training/run.py --protocol loso --dataset bnci2014_001 --data_path /path/to/mne_data \
  --epochs 70 --batch_size 32 --lr 5e-4 --weight_decay 1e-4 \
  --class_policy all --use_common_channels \
- --val_size 0.2 --patience 10 --min_delta 1e-4 --lr_schedule cosine \
- --within_cv_folds 5 --within_lr 3e-4 --within_label_smoothing 0.1
+ --val_size 0.2 --patience 10 --min_delta 1e-4 --lr_schedule warmup_cosine \
+ --warmup_epochs 10 --eta_min 1e-6 --within_cv_folds 5 --within_lr 3e-4 \
+ --within_label_smoothing 0.1 --no_class_weights
 ```
+
+Note: Euclidean alignment is currently always applied in the data loader.
 
 ## Outputs
 

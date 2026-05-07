@@ -162,6 +162,14 @@ class EEGModel(nn.Module):
         Returns:
             dict with task/domain logits.
         """
+        tokens, cnn_domain_output = self.encode_tokens(x, lambda_=lambda_)
+        return self.forward_from_tokens(
+            tokens, lambda_=lambda_, cnn_domain_output=cnn_domain_output
+        )
+
+    def encode_tokens(
+        self, x: torch.Tensor, lambda_: float = 0.0
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.apply_model_riemannian_reweight:
             x = riemannian_reweight(x)
 
@@ -174,9 +182,16 @@ class EEGModel(nn.Module):
             cnn_domain_input = self.grl(cnn_feat, lambda_)
             cnn_domain_output = self.cnn_domain_head(cnn_domain_input)
 
-        x = self.tokenizer(x)  # (B, N, D)
+        tokens = self.tokenizer(x)  # (B, N, D)
+        return tokens, cnn_domain_output
 
-        sequence, cls_token = self.vit(x)
+    def forward_from_tokens(
+        self,
+        tokens: torch.Tensor,
+        lambda_: float = 0.0,
+        cnn_domain_output: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        sequence, cls_token = self.vit(tokens)
 
         if self.attn_pool is not None:
             pooled = self.attn_pool(sequence[:, 1:, :])

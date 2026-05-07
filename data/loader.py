@@ -203,14 +203,9 @@ def create_dataloaders(
         loso_subject=loso_subject,
     )
 
-    if opts.apply_euclidean_align:
-        whitening = fit_euclidean_alignment(split.train_dataset.x, eps=opts.align_eps)
-        split.train_dataset.x = apply_euclidean_alignment(
-            split.train_dataset.x, whitening
-        )
-        split.test_dataset.x = apply_euclidean_alignment(
-            split.test_dataset.x, whitening
-        )
+    whitening = fit_euclidean_alignment(split.train_dataset.x, eps=opts.align_eps)
+    split.train_dataset.x = apply_euclidean_alignment(split.train_dataset.x, whitening)
+    split.test_dataset.x = apply_euclidean_alignment(split.test_dataset.x, whitening)
 
     train_generator = None
     if opts.seed is not None and opts.deterministic:
@@ -306,10 +301,9 @@ def create_within_subject_dataloaders(
     train_dataset = EEGDataset(x_sub[train_idx], y_sub[train_idx], s_sub[train_idx])
     test_dataset = EEGDataset(x_sub[test_idx], y_sub[test_idx], s_sub[test_idx])
 
-    if opts.apply_euclidean_align:
-        whitening = fit_euclidean_alignment(train_dataset.x, eps=opts.align_eps)
-        train_dataset.x = apply_euclidean_alignment(train_dataset.x, whitening)
-        test_dataset.x = apply_euclidean_alignment(test_dataset.x, whitening)
+    whitening = fit_euclidean_alignment(train_dataset.x, eps=opts.align_eps)
+    train_dataset.x = apply_euclidean_alignment(train_dataset.x, whitening)
+    test_dataset.x = apply_euclidean_alignment(test_dataset.x, whitening)
 
     train_generator = None
     if opts.seed is not None and opts.deterministic:
