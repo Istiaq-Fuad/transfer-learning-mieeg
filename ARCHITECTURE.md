@@ -193,6 +193,7 @@ stratified k-fold cross-validation. Metrics are averaged across folds per subjec
 
 Each run writes to `results/<protocol>_<dataset>_<timestamp>/`:
 
+- `config.json` with the resolved run arguments, data options, and model settings
 - `summary.json` with per-subject metrics and overall mean/std
 - `history.json` with per-epoch training and evaluation curves
 - `train.log` with detailed training logs

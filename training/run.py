@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import copy
 import json
 import logging
@@ -678,6 +679,40 @@ def _model_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _save_run_config(
+    run_dir: Path,
+    args: argparse.Namespace,
+    *,
+    selected_subjects: list[int],
+    available_subjects: list[int],
+    num_channels: int,
+    num_classes: int,
+    num_subjects: int,
+    model_config: dict[str, Any],
+    load_options: MoabbLoadOptions,
+    loader_options: DataLoaderOptions,
+) -> None:
+    config = {
+        "timestamp": run_dir.name.split("_", 2)[-1],
+        "run_dir": str(run_dir),
+        "protocol": args.protocol,
+        "dataset": args.dataset,
+        "subjects": selected_subjects,
+        "available_subjects": available_subjects,
+        "num_channels": num_channels,
+        "num_classes": num_classes,
+        "num_subjects": num_subjects,
+        "model": model_config,
+        "load_options": asdict(load_options),
+        "loader_options": asdict(loader_options),
+        "args": vars(args),
+    }
+    (run_dir / "config.json").write_text(
+        json.dumps(config, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+
 def _build_model(
     num_channels: int,
     num_classes: int,
@@ -757,6 +792,19 @@ def run(args: argparse.Namespace) -> None:
         len(selected_subjects),
         num_classes,
         device,
+    )
+
+    _save_run_config(
+        run_dir=run_dir,
+        args=args,
+        selected_subjects=selected_subjects,
+        available_subjects=available_subjects,
+        num_channels=num_channels,
+        num_classes=num_classes,
+        num_subjects=num_subjects,
+        model_config=_model_config_from_args(args),
+        load_options=load_options,
+        loader_options=loader_options,
     )
 
     per_subject: dict[str, Any] = {}
