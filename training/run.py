@@ -660,29 +660,46 @@ def _parse_subjects(value: str | None) -> list[int] | None:
     return [int(v.strip()) for v in value.split(",") if v.strip()]
 
 
+def _model_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "cnn_out_channels": args.cnn_out_channels,
+        "cnn_dropout": args.cnn_dropout,
+        "embedding_dim": args.embedding_dim,
+        "num_heads": args.num_heads,
+        "num_layers": args.num_layers,
+        "dropout": args.dropout,
+        "temporal_kernels": DEFAULT_MODEL_CONFIG["temporal_kernels"],
+        "multiscale_preserve_capacity": DEFAULT_MODEL_CONFIG[
+            "multiscale_preserve_capacity"
+        ],
+        "use_attention_pool": DEFAULT_MODEL_CONFIG["use_attention_pool"],
+        "attention_mix_init": DEFAULT_MODEL_CONFIG["attention_mix_init"],
+        "learnable_attention_mix": DEFAULT_MODEL_CONFIG["learnable_attention_mix"],
+    }
+
+
 def _build_model(
     num_channels: int,
     num_classes: int,
     num_subjects: int,
     use_rope: bool,
+    model_config: dict[str, Any],
 ) -> EEGModel:
     return EEGModel(
         num_channels=num_channels,
         num_classes=num_classes,
         num_subjects=num_subjects,
-        cnn_out_channels=DEFAULT_MODEL_CONFIG["cnn_out_channels"],
-        cnn_dropout=DEFAULT_MODEL_CONFIG["cnn_dropout"],
-        embedding_dim=DEFAULT_MODEL_CONFIG["embedding_dim"],
-        num_heads=DEFAULT_MODEL_CONFIG["num_heads"],
-        num_layers=DEFAULT_MODEL_CONFIG["num_layers"],
-        dropout=DEFAULT_MODEL_CONFIG["dropout"],
-        temporal_kernels=DEFAULT_MODEL_CONFIG["temporal_kernels"],
-        multiscale_preserve_capacity=DEFAULT_MODEL_CONFIG[
-            "multiscale_preserve_capacity"
-        ],
-        use_attention_pool=DEFAULT_MODEL_CONFIG["use_attention_pool"],
-        attention_mix_init=DEFAULT_MODEL_CONFIG["attention_mix_init"],
-        learnable_attention_mix=DEFAULT_MODEL_CONFIG["learnable_attention_mix"],
+        cnn_out_channels=model_config["cnn_out_channels"],
+        cnn_dropout=model_config["cnn_dropout"],
+        embedding_dim=model_config["embedding_dim"],
+        num_heads=model_config["num_heads"],
+        num_layers=model_config["num_layers"],
+        dropout=model_config["dropout"],
+        temporal_kernels=model_config["temporal_kernels"],
+        multiscale_preserve_capacity=model_config["multiscale_preserve_capacity"],
+        use_attention_pool=model_config["use_attention_pool"],
+        attention_mix_init=model_config["attention_mix_init"],
+        learnable_attention_mix=model_config["learnable_attention_mix"],
         use_rope=use_rope,
     )
 
@@ -752,6 +769,7 @@ def run(args: argparse.Namespace) -> None:
     base_weight_decay = args.weight_decay
     base_label_smoothing = args.label_smoothing
     use_domain_loss = args.protocol == "loso" and args.domain_loss_weight > 0.0
+    model_config = _model_config_from_args(args)
     if args.protocol == "within":
         base_lr = args.within_lr
         base_weight_decay = args.within_weight_decay
@@ -782,6 +800,7 @@ def run(args: argparse.Namespace) -> None:
             num_classes,
             num_subjects,
             use_rope=args.use_rope,
+            model_config=model_config,
         )
         pretrain_best, pretrain_history = train_one_subject(
             model=pretrain_model,
@@ -923,6 +942,7 @@ def run(args: argparse.Namespace) -> None:
                     num_classes,
                     num_subjects,
                     use_rope=args.use_rope,
+                    model_config=model_config,
                 )
                 if pretrained_state is not None:
                     model.load_state_dict(pretrained_state)
@@ -1001,6 +1021,7 @@ def run(args: argparse.Namespace) -> None:
             num_classes,
             num_subjects,
             use_rope=args.use_rope,
+            model_config=model_config,
         )
         if pretrained_state is not None:
             model.load_state_dict(pretrained_state)
@@ -1125,6 +1146,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_common_channels", action="store_true", default=False)
     parser.add_argument("--epochs", type=int, default=70)
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument(
+        "--cnn_out_channels",
+        type=int,
+        default=DEFAULT_MODEL_CONFIG["cnn_out_channels"],
+    )
+    parser.add_argument(
+        "--cnn_dropout",
+        type=float,
+        default=DEFAULT_MODEL_CONFIG["cnn_dropout"],
+    )
+    parser.add_argument(
+        "--embedding_dim",
+        type=int,
+        default=DEFAULT_MODEL_CONFIG["embedding_dim"],
+    )
+    parser.add_argument(
+        "--num_heads",
+        type=int,
+        default=DEFAULT_MODEL_CONFIG["num_heads"],
+    )
+    parser.add_argument(
+        "--num_layers",
+        type=int,
+        default=DEFAULT_MODEL_CONFIG["num_layers"],
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=DEFAULT_MODEL_CONFIG["dropout"],
+    )
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--within_lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
