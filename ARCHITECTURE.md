@@ -1,6 +1,6 @@
 # Architecture and Data Flow
 
-This repository implements a simplified EEG motor imagery training pipeline. It is designed to load MOABB motor imagery datasets, preprocess them, and run either leave-one-subject-out (LOSO) or within-subject training/evaluation using the current EEG model.
+This repository implements an EEG motor imagery training pipeline. It is designed to load MOABB motor imagery datasets, preprocess them, and run either leave-one-subject-out (LOSO) or within-subject training/evaluation using the current EEG model.
 
 > Update this file whenever the codebase changes.
 
@@ -19,12 +19,23 @@ The command-line interface controls:
 - `--class_policy`: `all` or `left_right`
 - `--use_common_channels`: use `_COMMON_CHANNELS` for consistent channel subsets
 - `--data_path`: optional path for MOABB/MNE data caches
+- `--test_size`: test split size for within-subject or random split
 - `--val_size`: validation split size inside the training set
 - `--within_cv_folds`: number of folds for within-subject CV (1 disables CV)
+- `--selection_metric`: `accuracy` or `kappa` for early stopping
+- `--patience`, `--min_delta`: early stopping behavior
 - `--lr_schedule`: `none`, `cosine`, or `warmup_cosine`
-- `--warmup_epochs`: warmup length for `warmup_cosine`
-- `--eta_min`: minimum LR for cosine schedules
+- `--warmup_epochs`, `--eta_min`: warmup/cosine schedule controls
+- `--label_smoothing`, `--within_label_smoothing`: label smoothing
 - `--no_class_weights`: disable class-weighted loss
+- `--subject_balanced_sampling`: reweight subjects in the training loader
+- `--no_augment`, `--augment_crop_ratio`, `--augment_noise_sigma`, `--augment_channel_dropout`
+- `--mixup_alpha`, `--no_mixup`
+- `--domain_loss_weight`, `--domain_lambda_max`: adversarial domain loss (LOSO)
+- `--two_phase_loso` with `--pretrain_*` and `--finetune_*`
+- `--calibration_trials`, `--calibration_steps`, `--calibration_*`
+- Model capacity: `--cnn_out_channels`, `--embedding_dim`, `--num_heads`, `--num_layers`, `--dropout`
+- `--no_rope`: disable RoPE attention
 - Hyperparameters: `--epochs`, `--batch_size`, `--lr`, `--weight_decay`, etc.
 
 ## 2. Data flow
@@ -59,11 +70,13 @@ The training protocol chooses one of two split functions in `data/loader.py`:
 - `create_within_subject_dataloaders(...)` for within-subject evaluation
   - data for the target subject is split into train/test folds
   - an additional validation split is carved out of the training set
+  - for `--within_cv_folds > 1`, folds are built in `training/run.py` and the
+    whitening matrix is fit on each fold's training split
 
 Both splitters use:
 
 - stratified splits on class labels
-- Euclidean alignment via `training.utils.fit_euclidean_alignment(...)` (currently always on)
+- Euclidean alignment via `training.utils.fit_euclidean_alignment(...)` (always on)
 - optional subject-balanced sampling in the training loader
 
 ### 2.3 Torch dataset abstraction
@@ -125,6 +138,8 @@ The model also includes:
 
 - gradient reversal layer (`GRL`) for adversarial domain adaptation support
 - optional CNN domain head, though current training uses only task logits
+- optional RoPE attention in the transformer blocks (positional embeddings are disabled when RoPE is on)
+- token-level mixup support via `encode_tokens(...)` and `forward_from_tokens(...)`
 
 ## 4. Training flow
 
@@ -132,22 +147,27 @@ The model also includes:
 
 1. Load data and determine subjects
 2. Build model with default hyperparameters
-3. For each selected subject:
-   - build train/test loaders
-   - run `train_one_subject(...)`
-4. Save summary and history JSON files
+3. Optional cross-subject pretraining for LOSO (`--two_phase_loso`)
+4. For each selected subject:
+
+- build train/test loaders
+- run `train_one_subject(...)`
+- optional calibration on held-out test trials (LOSO only)
+
+5. Save summary and history JSON files
 
 ### 4.1 Per-epoch training
 
 - uses `torch.optim.AdamW`
 - `torch.nn.CrossEntropyLoss` with optional class weighting and label smoothing
-- optional cosine or warmup+cosine learning-rate scheduler
+- optional cosine or warmup+cosine learning-rate scheduler (LambdaLR)
 - each epoch:
   - forward pass through model
-  - compute task loss only
+  - compute task loss only, with optional domain loss (LOSO)
   - backward pass and optimizer step
   - evaluation on the validation loader (used for early stopping)
   - evaluation on the held-out test loader (not used for early stopping)
+- optional CNN freeze period during LOSO fine-tuning (`--finetune_freeze_cnn_epochs`)
 
 ### 4.2 Evaluation
 
@@ -155,11 +175,19 @@ The model also includes:
 
 - accuracy
 - Cohen's kappa
+- macro F1 and per-class F1
+- confusion matrix
 
 ### 4.3 Within-subject cross-validation
 
 When `--within_cv_folds` is greater than 1, each subject is evaluated using
 stratified k-fold cross-validation. Metrics are averaged across folds per subject.
+
+### 4.4 Optional augmentations, mixup, and calibration
+
+- augmentations: random temporal crop, Gaussian noise, and channel dropout
+- mixup: applied in token space before the transformer
+- calibration: `CalibrationLayer` trained on a subset of test trials (LOSO only)
 
 ## 5. Outputs
 
@@ -168,6 +196,9 @@ Each run writes to `results/<protocol>_<dataset>_<timestamp>/`:
 - `summary.json` with per-subject metrics and overall mean/std
 - `history.json` with per-epoch training and evaluation curves
 - `train.log` with detailed training logs
+- `pretrain_summary.json` and `pretrain_history.json` when `--two_phase_loso` is used
+- `summary.json` may include `per_subject_raw`, `per_subject_calibrated`, and
+  `per_subject_folds` when applicable
 
 ## 6. Maintenance guideline
 
@@ -185,5 +216,6 @@ This project is intentionally simplified to:
 - load all motor imagery classes per dataset by default (no left/right filtering)
 - use all EEG channels per dataset by default, with an optional common-channel mode
 - use a single branded model pipeline
-- support only supervised LOSO and within-subject runs
-- avoid pretraining or domain adaptation complexity in the current main flow
+- support supervised LOSO and within-subject runs, with optional domain-adversarial loss
+- optionally run cross-subject pretraining and per-subject fine-tuning
+- optionally perform lightweight test-time calibration
