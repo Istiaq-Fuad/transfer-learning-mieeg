@@ -18,26 +18,6 @@ from training.utils import apply_euclidean_alignment, fit_euclidean_alignment
 from utils.reproducibility import build_torch_generator
 
 
-_COMMON_CHANNELS = [
-    "FC3",
-    "FC1",
-    "FC2",
-    "FC4",
-    "C5",
-    "C3",
-    "C1",
-    "Cz",
-    "C2",
-    "C4",
-    "C6",
-    "CP3",
-    "CP1",
-    "CPz",
-    "CP2",
-    "CP4",
-]
-
-
 class EEGDataset(Dataset):
     """Simple EEG dataset returning x, y, and subject_id."""
 
@@ -72,7 +52,6 @@ class MoabbLoadOptions:
     subjects: list[int] | None = None
     max_subjects: int | None = None
     class_policy: str = "all"
-    use_common_channels: bool = False
     mne_log_level: str | None = "ERROR"
     moabb_log_level: str | None = "ERROR"
     show_progress: bool = True
@@ -638,8 +617,6 @@ def load_moabb_motor_imagery_dataset(
     resolved_data_path = _configure_moabb_data_path(data_path)
 
     class_policy = str(opts.class_policy).strip().lower()
-    channels = _COMMON_CHANNELS if opts.use_common_channels else None
-
     if class_policy == "left_right":
         if LeftRightImagery is not None:
             paradigm = LeftRightImagery(
@@ -648,7 +625,6 @@ def load_moabb_motor_imagery_dataset(
                 tmin=opts.tmin,
                 tmax=opts.tmax,
                 resample=opts.resample,
-                channels=channels,
             )
         else:
             paradigm = MotorImagery(
@@ -659,7 +635,6 @@ def load_moabb_motor_imagery_dataset(
                 tmin=opts.tmin,
                 tmax=opts.tmax,
                 resample=opts.resample,
-                channels=channels,
             )
     elif class_policy == "all":
         paradigm = MotorImagery(
@@ -668,7 +643,6 @@ def load_moabb_motor_imagery_dataset(
             tmin=opts.tmin,
             tmax=opts.tmax,
             resample=opts.resample,
-            channels=channels,
         )
     else:
         raise ValueError("Unsupported class_policy. Use one of: all, left_right")

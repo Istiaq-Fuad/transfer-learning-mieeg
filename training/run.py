@@ -718,6 +718,7 @@ def _build_model(
     num_classes: int,
     num_subjects: int,
     use_rope: bool,
+    apply_model_riemannian_reweight: bool,
     model_config: dict[str, Any],
 ) -> EEGModel:
     return EEGModel(
@@ -736,6 +737,7 @@ def _build_model(
         attention_mix_init=model_config["attention_mix_init"],
         learnable_attention_mix=model_config["learnable_attention_mix"],
         use_rope=use_rope,
+        apply_model_riemannian_reweight=apply_model_riemannian_reweight,
     )
 
 
@@ -750,7 +752,6 @@ def run(args: argparse.Namespace) -> None:
     load_options = MoabbLoadOptions(
         subjects=subjects,
         class_policy=args.class_policy,
-        use_common_channels=args.use_common_channels,
         show_progress=True,
     )
 
@@ -823,10 +824,9 @@ def run(args: argparse.Namespace) -> None:
         base_weight_decay = args.within_weight_decay
         base_label_smoothing = args.within_label_smoothing
 
-    pretrained_state: dict[str, torch.Tensor] | None = None
-    if args.protocol == "loso" and args.two_phase_loso and args.pretrain_epochs > 0:
-        logger.info("Starting cross-subject pretraining")
-        pretrain_dataset = EEGDataset(x, y, subject_ids)
+    def _run_pretrain(
+        pretrain_dataset: EEGDataset, subject_tag: str | None = None
+    ) -> dict[str, torch.Tensor]:
         whitening = fit_euclidean_alignment(
             pretrain_dataset.x,
             eps=loader_options.align_eps,
@@ -848,6 +848,7 @@ def run(args: argparse.Namespace) -> None:
             num_classes,
             num_subjects,
             use_rope=args.use_rope,
+            apply_model_riemannian_reweight=args.riemannian_reweight,
             model_config=model_config,
         )
         pretrain_best, pretrain_history = train_one_subject(
@@ -878,15 +879,29 @@ def run(args: argparse.Namespace) -> None:
             freeze_cnn_epochs=0,
             logger=logger,
         )
-        pretrained_state = copy.deepcopy(pretrain_model.state_dict())
-        (run_dir / "pretrain_summary.json").write_text(
+        if subject_tag is None:
+            summary_path = run_dir / "pretrain_summary.json"
+            history_path = run_dir / "pretrain_history.json"
+        else:
+            summary_path = run_dir / f"pretrain_summary_subject_{subject_tag}.json"
+            history_path = run_dir / f"pretrain_history_subject_{subject_tag}.json"
+        summary_path.write_text(
             json.dumps(pretrain_best, indent=2),
             encoding="utf-8",
         )
-        (run_dir / "pretrain_history.json").write_text(
+        history_path.write_text(
             json.dumps(pretrain_history, indent=2),
             encoding="utf-8",
         )
+        return copy.deepcopy(pretrain_model.state_dict())
+
+    pretrained_state: dict[str, torch.Tensor] | None = None
+    pretrain_cache: dict[int, dict[str, torch.Tensor]] = {}
+    if args.protocol == "loso" and args.two_phase_loso and args.pretrain_epochs > 0:
+        if args.pretrain_scope == "global":
+            logger.info("Starting cross-subject pretraining")
+            pretrain_dataset = EEGDataset(x, y, subject_ids)
+            pretrained_state = _run_pretrain(pretrain_dataset)
 
     for idx, subject in enumerate(selected_subjects, start=1):
         logger.info(
@@ -990,6 +1005,7 @@ def run(args: argparse.Namespace) -> None:
                     num_classes,
                     num_subjects,
                     use_rope=args.use_rope,
+                    apply_model_riemannian_reweight=args.riemannian_reweight,
                     model_config=model_config,
                 )
                 if pretrained_state is not None:
@@ -1036,6 +1052,30 @@ def run(args: argparse.Namespace) -> None:
             histories[str(subject)] = fold_histories
             continue
 
+        subject_pretrained_state = pretrained_state
+        if (
+            args.protocol == "loso"
+            and args.two_phase_loso
+            and args.pretrain_epochs > 0
+            and args.pretrain_scope == "train_subjects"
+        ):
+            subject_key = int(subject)
+            if subject_key not in pretrain_cache:
+                logger.info(
+                    "Starting LOSO pretraining excluding subject %d",
+                    subject_key,
+                )
+                mask = subject_ids != subject_key
+                if int(mask.sum()) == 0:
+                    raise ValueError(
+                        f"No training subjects available for LOSO pretrain excluding {subject_key}"
+                    )
+                pretrain_dataset = EEGDataset(x[mask], y[mask], subject_ids[mask])
+                pretrain_cache[subject_key] = _run_pretrain(
+                    pretrain_dataset, subject_tag=str(subject_key)
+                )
+            subject_pretrained_state = pretrain_cache[subject_key]
+
         if args.protocol == "loso":
             train_loader, test_loader = create_dataloaders(
                 x=x,
@@ -1069,10 +1109,11 @@ def run(args: argparse.Namespace) -> None:
             num_classes,
             num_subjects,
             use_rope=args.use_rope,
+            apply_model_riemannian_reweight=args.riemannian_reweight,
             model_config=model_config,
         )
-        if pretrained_state is not None:
-            model.load_state_dict(pretrained_state)
+        if subject_pretrained_state is not None:
+            model.load_state_dict(subject_pretrained_state)
         best, history = train_one_subject(
             model=model,
             train_loader=train_loader,
@@ -1191,7 +1232,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="all",
         choices=["all", "left_right"],
     )
-    parser.add_argument("--use_common_channels", action="store_true", default=False)
     parser.add_argument("--epochs", type=int, default=70)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument(
@@ -1252,6 +1292,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no_rope", dest="use_rope", action="store_false", default=True
     )
+    parser.add_argument(
+        "--riemannian_reweight",
+        action="store_true",
+        default=False,
+        help="Apply Riemannian trace-normalized reweighting inside the model forward pass. "
+        "Default False (euclidean alignment alone is sufficient for cross-subject normalization).",
+    )
     parser.add_argument("--domain_loss_weight", type=float, default=0.1)
     parser.add_argument("--domain_lambda_max", type=float, default=0.3)
     parser.add_argument("--mixup_alpha", type=float, default=0.2)
@@ -1272,6 +1319,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pretrain_lr", type=float, default=1e-3)
     parser.add_argument("--pretrain_weight_decay", type=float, default=1e-4)
     parser.add_argument("--pretrain_val_size", type=float, default=0.1)
+    parser.add_argument(
+        "--pretrain_scope",
+        type=str,
+        default="global",
+        choices=["global", "train_subjects"],
+    )
     parser.add_argument("--finetune_epochs", type=int, default=20)
     parser.add_argument("--finetune_lr", type=float, default=1e-4)
     parser.add_argument("--finetune_weight_decay", type=float, default=1e-4)
